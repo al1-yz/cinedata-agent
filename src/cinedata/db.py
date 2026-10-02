@@ -16,6 +16,12 @@ fallback silencioso):
 5. Prazo por progress handler e limite de linhas por `fetchmany(max_rows + 1)`, sem reescrever o
    SQL (nada de acrescentar LIMIT).
 
+Cargas internas grandes (por exemplo, o índice de entidades) usam `execute(sql, max_rows=...,
+timeout_s=...)`: os dois parâmetros valem só para aquela chamada, passam por validação e teto
+(`MAX_BULK_ROWS`, `MAX_TIMEOUT_S`) e mantêm todas as outras camadas (mesma conexão, mesmo lock,
+authorizer, limites do SQLite). Eles NUNCA devem ser expostos ao modelo: a ferramenta `run_sql`
+chama `execute(sql)` sem eles.
+
 O pré-filtro de texto (primeira palavra SELECT/WITH) restringe a superfície sintática e melhora as
 mensagens; mesmo sem ele, as demais camadas continuam garantindo o acesso somente leitura e
 bloqueando operações fora da política de segurança.
@@ -53,6 +59,7 @@ MIN_SQLITE_VERSION = (3, 31, 0)  # TRUSTED_SCHEMA (3.31), DQS_* (3.29) e DEFENSI
 DEFAULT_MAX_CELL_CHARS = 1_000
 MAX_SQL_BYTES = 20_000
 MAX_TIMEOUT_S = 3_600.0
+MAX_BULK_ROWS = 1_000_000  # teto do `max_rows` por chamada (cargas internas, nunca o modelo)
 CACHE_SIZE_KIB = 65_536
 PROGRESS_INTERVAL = 1_000  # instruções da VM entre verificações do prazo (excesso medido: <= 0,3 s)
 MAX_DENIALS = 5
@@ -217,7 +224,7 @@ class QueryResult:
     columns: tuple[str, ...]
     rows: tuple[tuple[object, ...], ...]
     truncated: bool  # havia mais de `max_rows` linhas; só as primeiras `max_rows` foram devolvidas
-    max_rows: int
+    max_rows: int  # o teto EFETIVO desta chamada (o da instância ou o override)
     elapsed_s: float
     truncated_cells: int  # células de texto cortadas por passarem de `max_cell_chars`
 
@@ -597,6 +604,24 @@ _NO_SUCH_COLUMN = re.compile(r"no such column: (?P<name>.+?)(?: - should this be
 _AMBIGUOUS = re.compile(r"ambiguous column name: (?P<name>.+)")
 
 
+def _check_max_rows(value: object, *, ceiling: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("max_rows deve ser um inteiro maior ou igual a 1")
+    if ceiling is not None and value > ceiling:
+        raise ValueError(f"max_rows deve ser no máximo {ceiling}")
+    return value
+
+
+def _check_timeout_s(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("timeout_s deve ser um número (int ou float), em segundos")
+    if not 0 < value <= MAX_TIMEOUT_S:  # também rejeita nan, inf e -inf
+        raise ValueError(
+            f"timeout_s deve ser finito e estar entre 0 (exclusivo) e {MAX_TIMEOUT_S:g}"
+        )
+    return float(value)
+
+
 class SafeDatabase:
     """Conexão somente leitura, endurecida e serializada com o banco Gold."""
 
@@ -608,21 +633,16 @@ class SafeDatabase:
         timeout_s: float = DEFAULT_SQL_TIMEOUT_S,
         max_cell_chars: int = DEFAULT_MAX_CELL_CHARS,
     ) -> None:
-        if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1:
-            raise ValueError("max_rows deve ser um inteiro maior ou igual a 1")
-        if isinstance(timeout_s, bool) or not isinstance(timeout_s, int | float):
-            raise ValueError("timeout_s deve ser um número (int ou float), em segundos")
-        if not 0 < timeout_s <= MAX_TIMEOUT_S:  # também rejeita nan, inf e -inf
-            raise ValueError(
-                f"timeout_s deve ser finito e estar entre 0 (exclusivo) e {MAX_TIMEOUT_S:g}"
-            )
+        max_rows = _check_max_rows(max_rows)
+        timeout_s = _check_timeout_s(timeout_s)
         if isinstance(max_cell_chars, bool) or not isinstance(max_cell_chars, int):
             raise ValueError("max_cell_chars deve ser um inteiro")
         if max_cell_chars < 10:
             raise ValueError("max_cell_chars deve ser pelo menos 10")
         self._path = Path(path)
         self._max_rows = max_rows
-        self._timeout_s = float(timeout_s)
+        self._timeout_s = timeout_s
+        self._call_timeout_s = timeout_s  # o prazo efetivo da chamada em andamento
         self._max_cell_chars = max_cell_chars
         self._lock = threading.Lock()
         self._authorizer = _Authorizer()
@@ -677,20 +697,29 @@ class SafeDatabase:
                 self._con.close()
                 self._con = None
 
-    def execute(self, sql: str) -> QueryResult:
+    def execute(
+        self, sql: str, *, max_rows: int | None = None, timeout_s: float | None = None
+    ) -> QueryResult:
         """Executa uma consulta de leitura e devolve até `max_rows` linhas.
+
+        `max_rows` e `timeout_s` substituem os da instância SÓ nesta chamada (cargas internas
+        grandes; ver o docstring do módulo). Têm teto e nunca devem vir do modelo.
 
         Levanta `QueryRejectedError` (política), `QueryFailedError` (SQL inválido),
         `QueryTimeoutError` (prazo) ou `DatabaseUnavailableError` (conexão fechada ou banco
         inutilizável). Um Ctrl+C durante a consulta relança `KeyboardInterrupt`.
         """
+        rows_limit = (
+            self._max_rows if max_rows is None else _check_max_rows(max_rows, ceiling=MAX_BULK_ROWS)
+        )
+        time_limit = self._timeout_s if timeout_s is None else _check_timeout_s(timeout_s)
         statement = _check_text(sql)
         if self._pregate_enabled:
             _check_statement_kind(statement)
         with self._lock:
             if self._con is None:
                 raise DatabaseUnavailableError("A conexão com o banco já foi fechada.")
-            return self._run(self._con, statement)
+            return self._run(self._con, statement, rows_limit, time_limit)
 
     # --- execução ---
 
@@ -702,11 +731,14 @@ class SafeDatabase:
             return 1
         return 0
 
-    def _run(self, con: sqlite3.Connection, sql: str) -> QueryResult:
+    def _run(
+        self, con: sqlite3.Connection, sql: str, max_rows: int, timeout_s: float
+    ) -> QueryResult:
         self._authorizer.reset()
         self._timed_out = False
+        self._call_timeout_s = timeout_s
         started = time.monotonic()
-        self._deadline = started + self._timeout_s  # armado só depois de obter o lock
+        self._deadline = started + timeout_s  # armado só depois de obter o lock
         con.set_progress_handler(self._progress, PROGRESS_INTERVAL)
         cursor: sqlite3.Cursor | None = None
         try:
@@ -717,7 +749,7 @@ class SafeDatabase:
                     hint=_READ_ONLY_HINT,
                 )
             columns = tuple(column[0] for column in cursor.description)
-            fetched = cursor.fetchmany(self._max_rows + 1)
+            fetched = cursor.fetchmany(max_rows + 1)
         except sqlite3.Error as exc:
             raise self._translate(exc) from exc
         finally:
@@ -725,10 +757,10 @@ class SafeDatabase:
                 cursor.close()
             con.set_progress_handler(None, 0)
 
-        truncated = len(fetched) > self._max_rows
+        truncated = len(fetched) > max_rows
         cut_cells = 0
         rows: list[tuple[object, ...]] = []
-        for raw in fetched[: self._max_rows]:
+        for raw in fetched[:max_rows]:
             cells = []
             for value in raw:
                 cell, was_cut = _normalize_cell(value, self._max_cell_chars)
@@ -739,7 +771,7 @@ class SafeDatabase:
             columns=columns,
             rows=tuple(rows),
             truncated=truncated,
-            max_rows=self._max_rows,
+            max_rows=max_rows,
             elapsed_s=time.monotonic() - started,
             truncated_cells=cut_cells,
         )
@@ -754,7 +786,7 @@ class SafeDatabase:
         text = str(exc)
         if self._timed_out:
             return QueryTimeoutError(
-                f"A consulta passou de {self._timeout_s:g} s e foi interrompida.",
+                f"A consulta passou de {self._call_timeout_s:g} s e foi interrompida.",
                 hint=_TIMEOUT_HINT,
             )
         if text == "interrupted":

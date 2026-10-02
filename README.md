@@ -4,10 +4,11 @@ Agente que responde, em linguagem natural, perguntas sobre o catálogo de filmes
 Analytics. Ele consulta a camada Gold (SQLite) por Text-to-SQL e **somente em modo leitura**.
 Projeto da atividade GenAI do Rocket Lab 2026.2.
 
-> **Status: marco M1a (acesso seguro ao banco).** Já existem a configuração, o diagnóstico
-> offline (`cinedata doctor`), a infraestrutura de testes e o `SafeDatabase`, a única porta de
-> entrada para o banco. O agente e a suíte de avaliação chegam nos próximos marcos, e este README
-> será completado a cada um deles.
+> **Status: marco M1b (resolução de entidades).** Já existem a configuração, o diagnóstico
+> offline (`cinedata doctor`), a infraestrutura de testes, o `SafeDatabase` (a única porta de
+> entrada para o banco) e o `EntityIndex`, que resolve nomes de filmes, pessoas, gêneros e
+> produtoras. O agente e a suíte de avaliação chegam nos próximos marcos, e este README será
+> completado a cada um deles.
 
 ## Requisitos
 
@@ -114,6 +115,36 @@ bloqueando operações fora da política de segurança.
 relógio" fica para as instruções do agente (M2) e para a avaliação (M3). O cancelamento de uma
 consulta rodando em thread de trabalho do agente também será validado no M2.
 
+**Cargas internas grandes.** `execute(sql, max_rows=..., timeout_s=...)` aceita um teto de linhas
+e um prazo só para aquela chamada, com limites máximos. Serve ao índice de entidades (424 mil
+pessoas) na MESMA conexão, com o mesmo authorizer e as mesmas allowlists. Esses parâmetros nunca
+são expostos ao modelo.
+
+## Resolução de entidades
+
+`EntityIndex` (`src/cinedata/entities.py`) transforma um texto livre em entidades do banco.
+`find(tipo, texto, role=None)` devolve um destes estados:
+
+| Estado | Quando | Resolve? |
+|---|---|---|
+| `exact_unique` | exatamente uma entidade tem o nome (sem maiúsculas, acentos nem pontuação) | sim |
+| `exact_multiple` | duas ou mais têm o mesmo nome: homônimos nunca são fundidos | não |
+| `partial_candidates` | sem nome exato; prefixo ou tokens do texto em outros nomes | não, nunca |
+| `fuzzy_suggestions` | sem parcial; nomes a 1 ou 2 edições por token | não, só sugere |
+| `none` | nada achado, ou texto vazio, longo demais ou inválido (`reason` diz qual) | |
+
+Cada candidato traz desambiguadores: filme = título, ano e `id_filme`; pessoa = nome e papel
+(`Diretor`, `Ator`, `Roteirista`); gênero e produtora = nome. Em `dim_people` cada papel é uma linha
+própria, então um nome sem `role` costuma dar `exact_multiple`. Os gêneros também respondem em
+português (Ação, Terror, Suspense, Ficção científica, Cinema TV...). A ordem dos candidatos é
+determinística e não depende da ordem do banco. Cada tipo é carregado na primeira busca que o
+usa, e uma carga que falhe, seja truncada ou venha vazia nunca deixa um índice parcial.
+
+**Limite conhecido do fuzzy.** Ele só sugere e tem recall limitado: com 1 edição por token a
+vizinhança é completa; com 2 (tokens de 6 letras ou mais), um token errado na primeira E na última
+letra ao mesmo tempo não é encontrado.
+
+
 ## Comandos
 
 ```bash
@@ -166,6 +197,7 @@ data/                 coloque aqui o cinerocket.db (não versionado)
 src/cinedata/
   config.py           configuração, validação e janela móvel de datas
   db.py               SafeDatabase: acesso somente leitura e endurecido ao banco
+  entities.py         EntityIndex: resolução de filmes, pessoas, gêneros e produtoras
   cli.py              comandos --version e doctor
 tests/                testes offline e testes `realdb`
 ```
