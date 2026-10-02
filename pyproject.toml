@@ -7,7 +7,7 @@ name = "cinedata-agent"
 dynamic = ["version"]
 description = "Agente Text-to-SQL somente leitura sobre a camada Gold da CineData Analytics (Rocket Lab 2026.2 - GenAI)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic-ai-slim[openrouter]==2.52.0",
     "python-dotenv>=1.0",
@@ -30,7 +30,7 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
