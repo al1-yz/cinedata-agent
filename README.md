@@ -4,11 +4,11 @@ Agente que responde, em linguagem natural, perguntas sobre o catálogo de filmes
 Analytics. Ele consulta a camada Gold (SQLite) por Text-to-SQL e **somente em modo leitura**.
 Projeto da atividade GenAI do Rocket Lab 2026.2.
 
-> **Status: marco M1b (resolução de entidades).** Já existem a configuração, o diagnóstico
+> **Status: marco M1c (casos de referência).** Já existem a configuração, o diagnóstico
 > offline (`cinedata doctor`), a infraestrutura de testes, o `SafeDatabase` (a única porta de
-> entrada para o banco) e o `EntityIndex`, que resolve nomes de filmes, pessoas, gêneros e
-> produtoras. O agente e a suíte de avaliação chegam nos próximos marcos, e este README será
-> completado a cada um deles.
+> entrada para o banco), o `EntityIndex`, que resolve nomes de filmes, pessoas, gêneros e
+> produtoras, e os casos de referência (gabarito) para a avaliação. O agente e a suíte de
+> avaliação chegam nos próximos marcos, e este README será completado a cada um deles.
 
 ## Requisitos
 
@@ -144,6 +144,77 @@ usa, e uma carga que falhe, seja truncada ou venha vazia nunca deixa um índice 
 vizinhança é completa; com 2 (tokens de 6 letras ou mais), um token errado na primeira E na última
 letra ao mesmo tempo não é encontrado.
 
+## Casos de referência (gabarito)
+
+`src/cinedata/reference.py` guarda a semântica aprovada e um SQL confiável e legível para as 14
+perguntas do enunciado ("Categorias de Perguntas e Exemplos (Não exaustivo)"). Elas são **exemplos
+oficiais e não exaustivos**: formam o conjunto mínimo de referência da avaliação, não a lista do
+que o agente responde. O agente (M2) vai gerar SQL livre sobre o esquema Gold para qualquer
+pergunta analítica válida e não depende de reconhecer um destes casos; eles servem para validar e
+avaliar respostas (M3), nunca como roteador de intenções.
+
+- Um caso (`ReferenceCase`) é um dado: id estável, pergunta, semântica, SQL, parâmetros (N de
+  exibição, janela em anos) e as colunas esperadas. `run_case` executa qualquer caso pelo
+  `SafeDatabase`, com o prazo normal, e recusa resultado truncado, colunas inesperadas ou chave
+  repetida. Paráfrases e perguntas novas entram com `ReferenceRegistry.register`, sem mudar o
+  executor (um teste registra um 15º caso).
+- Rankings usam `RANK()`: os empatados no corte do top-N entram (o resultado pode passar de N
+  linhas), e "o maior" devolve todos os líderes empatados.
+- Métricas calculadas são arredondadas antes de ranquear (dinheiro em 2 casas, notas em 9,
+  margens em 12), para que valores iguais empatem apesar do ponto flutuante. Um teste confere, no
+  banco inteiro, que isso empata os valores exatamente iguais e só eles.
+- "Últimos 5 anos" usa a data de referência do projeto (`CINEDATA_REFERENCE_DATE`), nunca o
+  relógio do SQLite. O gabarito do banco real usa 2026-10-01 (janela de 2021-10-01 a 2026-10-01).
+
+A pergunta de cada caso (`question`) é a redação literal do enunciado; reformulações ficam em
+`paraphrases`.
+
+| # | Pergunta (enunciado) | Decisões principais |
+|---|---|---|
+| 01 | Top 10 filmes com maior receita em R$ | `receita_brl`; receita ≈ faturamento ≈ bilheteria |
+| 02 | Lucro médio por gênero, considerando apenas filmes com receita informada | `lucro_brl` literal; orçamento não é exigido |
+| 03 | Filmes com maior margem de lucro, entre os que possuem receita e orçamento informados | (receita − orçamento) / receita, em REAL; receita > 0; top 10 |
+| 04 | Os 5 filmes mais populares | `popularidade` literal, sem remover valores estranhos |
+| 05 | Filmes com maior divergência entre a nota TMDB e a nota IMDb | IMDb > 0; TMDB 0 sem votos = sem nota, com votos = nota; top 10 |
+| 06 | Nota média IMDb por ano de lançamento | IMDb > 0, sem filtro de status ou data |
+| 07 | Ator com mais participações em filmes lançados nos últimos 5 anos | janela móvel inclusiva, `data_lancamento`, só `Lançado` |
+| 08 | Diretores com maior nota média (mínimo de 5 filmes) | 5 filmes dirigidos no total; média só de IMDb > 0; top 10 |
+| 09 | Dupla ator–diretor que mais trabalhou junta | filmes em comum pela ponte; nomes iguais não são excluídos |
+| 10 | Quantidade de filmes por gênero | filmes distintos por gênero, inclusive gêneros com zero |
+| 11 | Produtora com maior lucro total | soma de `lucro_brl`, sem filtro de receita e sem DISTINCT |
+| 12 | Gênero com maior margem de lucro média | média simples das margens por filme (não ponderada) |
+| 13 | Filmes mais avaliados pelos usuários | `dim_reviews.qtd_avaliacoes_usuarios`; top 10 |
+| 14 | Filmes em que a nota média dos usuários mais diverge da nota IMDb | média de usuários existente e IMDb > 0; top 10 |
+
+Quando o enunciado não fixa N, o top 10 é decisão de exibição. Os empates no corte também valem
+para os N do enunciado (01 e 04), embora no banco real eles não ocorram ali.
+
+**Ressalvas encontradas no banco real.**
+
+- O lucro da Gold existe mesmo com um lado faltando: sem orçamento, lucro = receita; sem receita,
+  lucro = −orçamento. O caso 02 segue o enunciado (exige só a receita) e o 11 soma esse lucro.
+- Receita e orçamento ficam ora em INTEGER, ora em REAL, e a divisão entre inteiros do SQLite
+  zera a margem; por isso o `CAST(... AS REAL)`. O binário também separa valores iguais: as
+  margens de "Bad Ben" e "Bad Ben: The Mandela Effect" são exatamente 1097/1100, mas o REAL difere
+  na última casa (com o arredondamento, empatam em 9º lugar). Já duas margens diferentes chegam a
+  diferir só na 11ª casa (7/8 e 0,87499999996), por isso margens usam 12 casas, e não 9.
+- 102 notas TMDB vêm com ruído binário (6,903999999999999 no lugar de 6,904).
+- A margem média por gênero (12) é dominada por receitas ínfimas: todos os gêneros têm média
+  negativa, e o líder, War, tem −5,35 (−535%).
+- Há `popularidade` igual a um ano do título ("La Fellinette" = 2020, "Wwe Survivor Series 2018"
+  = 2018); como aprovado, esses valores ficam no caso 04.
+- Linhas de `Diretor` incluem nomes que não são pessoas ("English", "Documentary", "Drama"); nenhum
+  aparece nos gabaritos 08 e 09.
+- Títulos se repetem (os mais avaliados são quase todos "Die Hart" com ids diferentes), por isso
+  todo resultado de filme traz `id_filme` como chave. Neste banco, os 95.645 filmes têm
+  `id_filme` distinto e não nulo (invariante verificado por um teste `realdb`), e `run_case`
+  recusa qualquer resultado com chave repetida.
+- Cruzar todo o elenco com toda a direção (caso 09) levou de 15 s a mais de 2 min, conforme a
+  formulação. O SQL de referência usa uma poda exata (um par não tem mais filmes juntos do que
+  cada pessoa tem sozinha) e roda em cerca de 2 s. Com o cache do sistema quente, os 14 casos
+  levam de 0,02 a 2,1 s; na primeira execução, com a máquina carregada, o mais lento (07) chegou
+  a 14 s, abaixo do prazo padrão de 30 s.
+
 
 ## Comandos
 
@@ -188,6 +259,18 @@ Os testes marcados `realdb` rodam contra o banco real e são **pulados com o mot
 `data/cinerocket.db` não existe. Use `pytest -m realdb` para rodar só eles e
 `pytest -m "not realdb"` para excluí-los.
 
+Os casos de referência têm dois arquivos de teste. `tests/test_reference.py` (offline) monta
+cenários sintéticos para cada armadilha e compara os 14 SQLs, em bancos aleatórios, com um oráculo
+independente em Python e aritmética exata (`tests/reference_oracle.py`).
+`tests/test_reference_realdb.py` confere o gabarito no banco real, compara os 14 casos com o
+mesmo oráculo sobre o banco inteiro e mede os tempos:
+
+```bash
+pytest tests/test_reference.py
+pytest -m realdb tests/test_reference_realdb.py
+pytest -m realdb -s tests/test_reference_realdb.py -k report
+```
+
 ## Estrutura
 
 ```text
@@ -198,6 +281,7 @@ src/cinedata/
   config.py           configuração, validação e janela móvel de datas
   db.py               SafeDatabase: acesso somente leitura e endurecido ao banco
   entities.py         EntityIndex: resolução de filmes, pessoas, gêneros e produtoras
+  reference.py        casos de referência (gabarito da avaliação) e executor genérico
   cli.py              comandos --version e doctor
 tests/                testes offline e testes `realdb`
 ```
