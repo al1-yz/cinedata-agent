@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cinedata-agent"
+dynamic = ["version"]
+description = "Agente Text-to-SQL somente leitura sobre a camada Gold da CineData Analytics (Rocket Lab 2026.2 - GenAI)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic-ai-slim[openrouter]==2.52.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+cinedata = "cinedata.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "cinedata.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cinedata"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S603"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not llm'"
+markers = [
+    "realdb: usa o cinerocket.db real (pulado quando o arquivo não existe)",
+    "llm: chama um LLM real e consome cota; fica fora do pytest padrão (use `pytest -m llm`)",
+]

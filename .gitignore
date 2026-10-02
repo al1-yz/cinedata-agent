@@ -1,0 +1,46 @@
+# Segredos e configuração local (NUNCA versionar)
+.env
+.env.*
+!.env.example
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Bancos SQLite em qualquer pasta (o banco da atividade tem ~581 MB) e arquivos auxiliares.
+# Se algum fixture SQLite precisar ser versionado no futuro, abra uma exceção explícita,
+# por exemplo: !tests/fixtures/exemplo.db
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs e saídas locais
+logs/
+evals/results/raw/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Caches de ferramentas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editores e sistema operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
