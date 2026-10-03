@@ -1,22 +1,26 @@
 """Interface de linha de comando do CineData Agent.
 
-Neste marco (M0) existem apenas `--version` e `doctor`; ambos funcionam offline. Importações
-pesadas (agente, SDKs de modelo) devem ficar dentro dos comandos que as usam, para que
-`--version` e `doctor` continuem instantâneos.
+Comandos: `--version` e `doctor` (offline) e `ask` (uma pergunta ao agente). Importações pesadas
+(agente, SDKs de modelo) ficam dentro de `ask`, para que `--version` e `doctor` continuem
+instantâneos.
 
-Códigos de saída: 0 = ok (o `doctor` pode listar avisos); 1 = `doctor` encontrou pendências;
-2 = uso ou configuração inválidos; 130 = interrompido (Ctrl+C).
+Códigos de saída: 0 = ok (o `doctor` pode listar avisos; no `ask`, inclusive pedidos de
+esclarecimento e recusas fora do escopo); 1 = `doctor` encontrou pendências, ou o `ask` não
+conseguiu responder (provedor, banco, limites do agente); 2 = uso ou configuração inválidos;
+130 = interrompido (Ctrl+C).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cinedata import __version__
 from cinedata.config import (
@@ -33,6 +37,9 @@ from cinedata.config import (
     ConfigError,
     load_settings,
 )
+
+if TYPE_CHECKING:
+    from cinedata.runtime import AgentOutcome, SqlExecution
 
 EXIT_OK = 0
 EXIT_PENDING = 1
@@ -65,6 +72,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_OK
         if args.command == "doctor":
             return _run_doctor()
+        if args.command == "ask":
+            return _run_ask(" ".join(args.question), show_sql=args.show_sql, as_json=args.json)
         parser.print_help()
         return EXIT_OK
     except KeyboardInterrupt:
@@ -113,7 +122,126 @@ def _build_parser() -> argparse.ArgumentParser:
             "avisos pedem conferência, mas não bloqueiam (código de saída 0)."
         ),
     )
+    ask = commands.add_parser(
+        "ask",
+        help="faz uma pergunta em linguagem natural sobre o catálogo",
+        description=(
+            "Responde uma pergunta consultando a camada Gold em modo somente leitura. Usa o "
+            "modelo do OpenRouter configurado e consome cota do provedor."
+        ),
+    )
+    ask.add_argument("question", nargs="+", metavar="PERGUNTA", help="a pergunta, entre aspas")
+    output = ask.add_mutually_exclusive_group()
+    output.add_argument(
+        "--show-sql",
+        action="store_true",
+        help="mostra o SQL executado (do rastro da aplicação, não do texto do modelo)",
+    )
+    output.add_argument(
+        "--json",
+        action="store_true",
+        help="saída JSON: a resposta do modelo separada dos metadados de execução",
+    )
     return parser
+
+
+# --- ask -------------------------------------------------------------------------------------
+
+
+def _run_ask(question: str, *, show_sql: bool, as_json: bool) -> int:
+    import pydantic_ai
+
+    from cinedata.agent import QuestionError, ask
+    from cinedata.db import SafeDatabaseError
+
+    pydantic_ai.BANNER_ENABLED = False  # a CLI é do usuário final: sem banner da biblioteca
+    try:
+        settings = load_settings()
+        outcome = ask(question, settings)
+    except QuestionError as error:
+        print(f"Pergunta inválida: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    except ConfigError as error:
+        print(f"Erro de configuração: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    except SafeDatabaseError as error:
+        print(f"Banco de dados indisponível: {error}", file=sys.stderr)
+        return EXIT_PENDING
+
+    if as_json:
+        print(_json_text(outcome.to_dict()))
+    else:
+        _print_outcome(outcome, show_sql=show_sql)
+    return EXIT_OK if outcome.ok else EXIT_PENDING
+
+
+def _print_outcome(outcome: AgentOutcome, *, show_sql: bool) -> None:
+    from cinedata.runtime import AnswerStatus
+
+    answer = outcome.answer
+    if answer is not None:
+        print(_safe(answer.answer))
+        for title, items in (("Premissas", answer.assumptions), ("Ressalvas", answer.caveats)):
+            if items:
+                print(f"\n{title}:")
+                for item in items:
+                    print(f"  - {_safe(item)}")
+    if outcome.notices:
+        print("\nAvisos do sistema:")
+        for notice in outcome.notices:
+            print(f"  - {_safe(notice)}")
+    if show_sql:
+        _print_sql(outcome.trace.sql_executions)
+
+    trace = outcome.trace
+    queries = len(trace.successful_sql())
+    labels = {
+        AnswerStatus.DATA_ANSWER: f"resposta baseada em {queries} consulta(s) ao banco",
+        AnswerStatus.CLARIFICATION: "pedido de esclarecimento",
+        AnswerStatus.INFO: "resposta informativa, sem dados do banco",
+        AnswerStatus.OUT_OF_SCOPE: "fora do escopo do catálogo",
+    }
+    parts = [labels[answer.status]] if answer is not None else []
+    if trace.models_used:
+        parts.append("modelo: " + ", ".join(_safe(name) for name in trace.models_used))
+    parts.append(f"{trace.model_responses} resposta(s) do modelo")
+    if answer is not None:
+        print(f"\n[{' · '.join(parts)}]")
+    if outcome.failure is not None:
+        print(f"Não foi possível responder: {_safe(outcome.failure.message)}", file=sys.stderr)
+        print(f"[{' · '.join(parts)}]", file=sys.stderr)
+
+
+def _print_sql(executions: Sequence[SqlExecution]) -> None:
+    print("\nSQL executado (rastro da aplicação):")
+    if not executions:
+        print("  nenhuma consulta")
+    for execution in executions:
+        if execution.ok:
+            status = f"ok, {execution.row_count} linha(s)"
+            if execution.truncated:
+                status += " (truncado)"
+        else:
+            status = f"{execution.status.value}: {execution.error or ''}"
+        if execution.elapsed_s is not None:
+            status += f", {execution.elapsed_s:.2f} s"
+        print(f"  [{execution.index}] {_safe(status)}")
+        for line in _safe(execution.sql).strip().splitlines():
+            print(f"      {line}")
+
+
+_CONTROL = {code: None for code in (*range(0x00, 0x20), *range(0x7F, 0xA0)) if code not in (9, 10)}
+
+
+def _safe(text: str) -> str:
+    """Tira caracteres de controle (sequências ANSI vindas do banco ou do modelo) da saída."""
+    return text.translate(_CONTROL)
+
+
+def _json_text(data: object) -> str:
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    # json já escapa os controles C0; os C1 (U+0080 a U+009F) também viram escapes.
+    return text.translate({code: f"\\u{code:04x}" for code in range(0x80, 0xA0)})
 
 
 def _run_doctor() -> int:

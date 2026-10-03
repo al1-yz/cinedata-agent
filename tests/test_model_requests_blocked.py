@@ -1,6 +1,8 @@
-"""Garante que nenhum teste consegue falar com um modelo real por acidente."""
+"""Garante que nenhum teste consegue falar com um modelo real (nem com a rede) por acidente."""
 
 from __future__ import annotations
+
+import socket
 
 import pytest
 from pydantic_ai import Agent, models
@@ -15,3 +17,9 @@ def test_real_model_requests_are_blocked() -> None:
     assert models.ALLOW_MODEL_REQUESTS is False
     with pytest.raises(RuntimeError, match="ALLOW_MODEL_REQUESTS"):
         agent.run_sync("pergunta de teste")
+
+
+def test_network_name_resolution_is_blocked() -> None:
+    with pytest.raises(OSError, match="rede bloqueada"):
+        socket.getaddrinfo("openrouter.ai", 443)
+    assert socket.getaddrinfo("127.0.0.1", 80)  # o loopback continua (laço de eventos, sqlite)
