@@ -279,6 +279,10 @@ class InteractiveStream(io.TextIOWrapper):
 def test_redirected_output_becomes_utf8_when_the_default_encoding_is_not(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Sem codificação explícita: com PYTHONIOENCODING ou PYTHONUTF8 no terminal de quem roda os
+    # testes (a solução de problemas sugere PYTHONUTF8=1), a CLI as respeitaria e não usaria UTF-8.
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
     raw = io.BytesIO()
     stdout = io.TextIOWrapper(raw, encoding="cp1252")  # padrão do Windows em PT-BR
     monkeypatch.setattr(sys, "stdout", stdout)
