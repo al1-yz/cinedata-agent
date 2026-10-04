@@ -37,13 +37,14 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "S"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["cinedata"]
+known-first-party = ["cinedata", "evals"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106", "S603"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # o pacote de avaliação `evals/` fica na raiz, fora do pacote instalado
 addopts = "-ra -m 'not llm'"
 markers = [
     "realdb: usa o cinerocket.db real (pulado quando o arquivo não existe)",

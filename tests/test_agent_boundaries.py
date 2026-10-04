@@ -125,6 +125,67 @@ def test_prompt_schema_is_exactly_the_safe_database_allowlist() -> None:
     assert "alembic_version" not in prompt and "sqlite_master" not in prompt
 
 
+def test_prompt_row_rules_separate_open_rankings_from_exhaustive_breakdowns() -> None:
+    prompt = " ".join(
+        build_instructions(reference_date=date(2026, 10, 1), max_rows=50, timeout_s=30).split()
+    )
+    assert (
+        "Sem N na pergunta, use 10" not in prompt
+    )  # a regra antiga cortava "por ano"/"por gênero"
+    start = prompt.index("Quantas linhas devolver")
+    rules = prompt[start : prompt.index("## ", start)]
+    open_ranking, breakdown, superlative, top_n = rules.split(" - ")[1:5]
+    assert "ranking ou lista aberta sem N na pergunta" in open_ranking
+    assert "padrão de exibição de 10" in open_ranking and "assumptions" in open_ranking
+    assert "detalhamento por grupo" in breakdown
+    assert all(f'"{group}"' in breakdown for group in ("por ano", "por gênero", "por status"))
+    assert "TODOS os grupos, até o teto de 50 linhas, sem LIMIT 10" in breakdown
+    assert "10" not in breakdown.replace("LIMIT 10", "")  # nenhum corte em 10 no detalhamento
+    assert "superlativo no singular" in superlative and "todos os empatados no topo" in superlative
+    assert "todos os empatados na N-ésima posição, mesmo passando de N linhas" in top_n
+
+
+def test_prompt_movie_ids_are_shown_only_when_title_and_year_collide() -> None:
+    prompt = " ".join(
+        build_instructions(reference_date=date(2026, 10, 1), max_rows=50, timeout_s=30).split()
+    )
+    sentences = [s.strip() for s in re.split(r"(?<=\.)\s+", prompt)]
+    # mesmo título, anos diferentes: o ano sempre aparece, e ele basta
+    assert any("mostre sempre o ano de lançamento" in s for s in sentences)
+    showing_ids = [s for s in sentences if "id_filme" in s and "mostre" in s]
+    assert len(showing_ids) == 2, showing_ids
+    collision, unique = showing_ids
+    # mesmo título E mesmo ano: o id_filme dessas linhas é obrigatório
+    assert collision.startswith(
+        "Se dois ou mais filmes devolvidos tiverem o mesmo título e o mesmo ano"
+    )
+    assert "mostre também o id_filme dessas linhas" in collision
+    # título + ano únicos: nenhuma exigência geral de expor ids
+    assert unique.startswith("Quando título e ano já distinguem os filmes")
+    assert "não mostre o id_filme" in unique
+    assert not any("sempre" in s and "id_filme" in s for s in sentences)
+
+
+def test_prompt_final_answer_keeps_the_ranking_order_and_comes_alone() -> None:
+    prompt = " ".join(
+        build_instructions(reference_date=date(2026, 10, 1), max_rows=50, timeout_s=30).split()
+    )
+    assert "ORDER BY determinístico" in prompt  # a ordem do SQL...
+    final = prompt[prompt.index("## Resposta final") :]
+    ranking = next(s for s in final.split(" - ") if s.startswith("Ranking:"))
+    # ...é a ordem que o texto apresenta (a mesma regra que a avaliação confere)
+    assert "mesma ordem do resultado do SQL" in ranking
+    assert "empatados podem vir em qualquer ordem entre si" in ranking
+    assert "Não reordene o ranking no texto" in ranking
+    assert any(s.startswith("Zero linhas: diga explicitamente") for s in final.split(" - "))
+    steps = prompt[prompt.index("## Como trabalhar") : prompt.index("## Esquema")]
+    assert "final_answer, sozinho, numa resposta própria" in steps
+    assert "nunca na mesma resposta de um run_sql ou find_entities" in steps
+    # o texto das respostas sem dados, que a avaliação confere, também está dito ao agente
+    assert "fora do seu escopo (o catálogo de filmes), sem atender ao pedido" in steps
+    assert "que tipos de pergunta sobre o catálogo você responde, sem citar números" in steps
+
+
 def test_real_llm_tests_are_opt_in() -> None:
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert "-m 'not llm'" in config["tool"]["pytest"]["ini_options"]["addopts"]

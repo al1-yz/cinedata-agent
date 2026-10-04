@@ -13,6 +13,11 @@ Ferramentas visíveis ao modelo:
 
 Garantias aplicadas em código, não no prompt:
 
+- Resposta final sozinha: nenhuma resposta final (de qualquer status) é aceita se a MESMA
+  resposta do modelo também pediu `run_sql` ou `find_entities`. O PydanticAI 2 ('graceful')
+  executa essas ferramentas (antes do final_answer, se vieram antes dele; depois, se vieram
+  depois), mas o texto já estava escrito sem o resultado delas. A recusa vira `ModelRetry` e o
+  modelo recebe, na requisição seguinte, os resultados e o motivo.
 - Fundamentação: status `data_answer` exige uma consulta bem-sucedida cujo resultado o modelo já
   tenha recebido numa requisição ANTERIOR à da resposta (validador de saída; a violação vira
   `ModelRetry`, dentro do orçamento de retries e de requisições).
@@ -63,7 +68,7 @@ from pydantic_ai import (
     capture_run_messages,
 )
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models import Model
 
 from cinedata.config import Settings
@@ -102,6 +107,7 @@ MAX_ENTITY_LOOKUPS = 8
 MAX_TOOL_RESULT_CHARS = 24_000  # tamanho máximo das linhas enviadas ao modelo por consulta
 TOOL_RETRIES = 2  # falhas SEGUIDAS da mesma ferramenta antes de encerrar a pergunta
 OUTPUT_RETRIES = 2  # respostas finais inválidas ou sem fundamentação antes de encerrar
+DATA_TOOLS = frozenset({"find_entities", "run_sql"})  # ferramentas cujo resultado precisa ser lido
 
 EntityKindName = Literal["filme", "pessoa", "genero", "produtora"]
 RoleName = Literal["Ator", "Diretor", "Roteirista"]
@@ -394,11 +400,39 @@ def _result_payload(result: QueryResult) -> tuple[dict[str, object], int]:
 # --- validação da resposta final -------------------------------------------------------------
 
 
+def tools_sent_with_the_answer(ctx: RunContext[AgentDeps]) -> list[str]:
+    """Ferramentas de dados pedidas na MESMA resposta do modelo que trouxe esta resposta final.
+
+    O validador recebe o histórico até essa resposta (a última mensagem). A regra olha a própria
+    resposta, não o número da requisição, então vale nas duas ordens em que o PydanticAI 2
+    executa as ferramentas dela: antes do final_answer (se vieram antes) ou depois dele.
+    """
+    response = ctx.messages[-1] if ctx.messages else None
+    calls = (
+        [part.tool_name for part in response.parts if isinstance(part, ToolCallPart)]
+        if isinstance(response, ModelResponse)
+        else []
+    )
+    if FINAL_TOOL not in calls:
+        # Falha fechada: sem ver a resposta que trouxe o final_answer, a regra não é conferível.
+        raise RuntimeError("o validador de saída não encontrou a resposta com o final_answer")
+    return sorted(set(calls) & DATA_TOOLS)
+
+
 async def require_grounding(ctx: RunContext[AgentDeps], answer: AgentAnswer) -> AgentAnswer:
-    """`data_answer` só com resultado já lido e sem entidade não resolvida escolhida sozinha."""
+    """Resposta final sozinha na resposta do modelo; `data_answer` só com resultado já lido e
+    sem entidade não resolvida escolhida sozinha."""
+    trace = ctx.deps.trace
+    if same := tools_sent_with_the_answer(ctx):
+        reason = (
+            f"Você chamou {' e '.join(same)} na mesma resposta do {FINAL_TOOL}: o texto foi "
+            "escrito antes de você ler o resultado. Leia os resultados que voltaram nesta "
+            f"mensagem e só então chame {FINAL_TOOL}, sozinho, numa resposta seguinte."
+        )
+        trace.output_rejections.append(OutputRejection(ctx.run_step, answer.status, reason))
+        raise ModelRetry(reason)
     if answer.status is not AnswerStatus.DATA_ANSWER:
         return answer
-    trace = ctx.deps.trace
     if not trace.has_result_before(ctx.run_step):
         reason = (
             "status data_answer exige que você já tenha lido o resultado de uma consulta "
@@ -620,5 +654,6 @@ __all__ = [
     "require_grounding",
     "run_blocking",
     "run_sql",
+    "tools_sent_with_the_answer",
     "validate_question",
 ]

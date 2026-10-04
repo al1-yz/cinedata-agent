@@ -227,6 +227,116 @@ def test_answer_sent_together_with_its_query_is_rejected(db: SafeDatabase) -> No
     assert outcome.trace.sql_executions[0].step == 1
 
 
+RELEVANT = "SELECT titulo, ano_lancamento FROM dim_movies ORDER BY titulo, id_filme"
+
+
+def sent_too_early(messages):  # noqa: ANN001, ANN201
+    """Turno de um modelo que leu o resultado e a recusa da resposta final prematura."""
+    [reason] = retries(messages)
+    assert "na mesma resposta do final_answer" in reason
+    assert returns(messages, "run_sql") or returns(messages, "find_entities")
+    return [final("data_answer", "Resposta lida.")]
+
+
+@pytest.mark.parametrize("final_first", [False, True], ids=["sql_antes", "final_antes"])
+def test_an_answer_sent_with_a_query_is_rejected_even_after_an_earlier_result(
+    db: SafeDatabase, final_first: bool
+) -> None:
+    # Resposta 1: um SQL qualquer, bem-sucedido. Resposta 2: o SQL que importa e a resposta final
+    # juntos. Havia um resultado anterior, mas o texto foi escrito sem ler o SQL relevante; o
+    # PydanticAI 2 executa os dois, em qualquer ordem, e o validador olha a própria resposta.
+    together = [sql(RELEVANT), final("data_answer", "Resposta escrita sem ler.")]
+    script = Script(
+        [sql(COUNT_MOVIES)],
+        list(reversed(together)) if final_first else together,
+        sent_too_early,
+    )
+    outcome = run(db, script)
+
+    assert outcome.ok and outcome.answer is not None
+    assert outcome.answer.answer == "Resposta lida."
+    assert [(e.step, e.status) for e in outcome.trace.sql_executions] == [
+        (1, SqlStatus.OK),
+        (2, SqlStatus.OK),
+    ]
+    [rejection] = outcome.trace.output_rejections
+    assert rejection.step == 2 and "run_sql" in rejection.reason
+    assert outcome.trace.model_responses == script.requests == 3
+
+
+def test_the_same_queries_answered_in_a_later_response_are_accepted(db: SafeDatabase) -> None:
+    script = Script([sql(COUNT_MOVIES)], [sql(RELEVANT)], [final("data_answer", "Resposta.")])
+    outcome = run(db, script)
+
+    assert outcome.ok and outcome.trace.output_rejections == []
+    assert [e.step for e in outcome.trace.sql_executions] == [1, 2]
+    assert outcome.trace.model_responses == 3
+
+
+@pytest.mark.parametrize("final_first", [False, True], ids=["busca_antes", "final_antes"])
+def test_a_clarification_sent_with_its_lookup_is_rejected(
+    db: SafeDatabase, final_first: bool
+) -> None:
+    together = [find("filme", "Dune"), final("clarification", "Qual Dune?")]
+
+    def after_reading(messages):  # noqa: ANN001, ANN202
+        [reason] = retries(messages)
+        assert "find_entities na mesma resposta" in reason
+        [payload] = returns(messages, "find_entities")
+        years = " ou ".join(str(c["year"]) for c in payload["candidates"])
+        return [final("clarification", f"Qual Dune: {years}?")]
+
+    script = Script(list(reversed(together)) if final_first else together, after_reading)
+    outcome = run(db, script)
+
+    assert outcome.ok and outcome.answer is not None
+    assert outcome.answer.status is AnswerStatus.CLARIFICATION
+    assert outcome.answer.answer in ("Qual Dune: 1984 ou 2021?", "Qual Dune: 2021 ou 1984?")
+    [rejection] = outcome.trace.output_rejections
+    assert (rejection.step, rejection.status) == (1, AnswerStatus.CLARIFICATION)
+    assert [lookup.step for lookup in outcome.trace.entity_lookups] == [1]
+
+
+@pytest.mark.parametrize("status", ["info", "out_of_scope"])
+def test_no_final_status_may_share_a_response_with_a_data_tool(
+    db: SafeDatabase, status: str
+) -> None:
+    script = Script([sql(COUNT_MOVIES), final(status, "Texto.")], [final(status, "Texto.")])
+    outcome = run(db, script)
+
+    assert outcome.ok and outcome.answer is not None and outcome.answer.status.value == status
+    assert [r.step for r in outcome.trace.output_rejections] == [1]
+
+
+def test_a_failed_query_sent_with_the_answer_is_corrected_in_the_next_response(
+    db: SafeDatabase,
+) -> None:
+    # A consulta falha (retry da ferramenta) e a resposta final da mesma resposta é recusada
+    # (retry de saída): o modelo recebe os dois motivos juntos e responde de novo.
+    script = Script(
+        [sql(COUNT_MOVIES)],
+        [sql("SELECT coluna_que_nao_existe FROM dim_movies"), final("data_answer", "Chute.")],
+        [final("data_answer", "Há 7 filmes.")],
+    )
+    outcome = run(db, script)
+
+    assert outcome.ok and outcome.answer is not None and outcome.answer.answer == "Há 7 filmes."
+    assert statuses(outcome) == [SqlStatus.OK, SqlStatus.FAILED]
+    assert [r.step for r in outcome.trace.output_rejections] == [2]
+
+
+def test_a_model_that_always_answers_with_its_query_ends_in_a_protocol_failure(
+    db: SafeDatabase,
+) -> None:
+    turns = [[sql(f"{COUNT_MOVIES} WHERE {n} = {n}"), final("data_answer", "Já sei.")]
+             for n in range(OUTPUT_RETRIES + 1)]  # fmt: skip
+    outcome = run(db, Script([sql(COUNT_MOVIES)], *turns))
+
+    assert outcome.answer is None
+    assert outcome.failure is not None and outcome.failure.kind is FailureKind.AGENT_PROTOCOL
+    assert len(outcome.trace.output_rejections) == OUTPUT_RETRIES + 1
+
+
 def test_a_model_that_never_queries_ends_in_a_protocol_failure(db: SafeDatabase) -> None:
     script = Script(*[[final("data_answer", "Inventado.")]] * (OUTPUT_RETRIES + 1))
     outcome = run(db, script)
@@ -774,7 +884,7 @@ def test_tools_expose_no_limit_or_connection_parameters(
     outcome = run(db, script)
 
     tools = {tool.name: tool.parameters_json_schema for tool in script.seen[0][1].function_tools}
-    assert set(tools) == {"find_entities", "run_sql"}
+    assert set(tools) == {"find_entities", "run_sql"} == agent_module.DATA_TOOLS  # todas são lidas
     assert set(tools["run_sql"]["properties"]) == {"sql"}
     assert set(tools["find_entities"]["properties"]) == {"kind", "text", "role"}
     assert all(schema.get("additionalProperties") is False for schema in tools.values())
