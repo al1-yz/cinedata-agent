@@ -7,10 +7,13 @@
 - Rede bloqueada: resolver um nome fora do loopback falha. Toda conexão TCP do Python a um host
   por nome (sync ou asyncio, inclusive httpx) passa por `socket.getaddrinfo` antes de conectar.
   Só os testes marcados `llm` (fora do pytest padrão) ficam livres.
+- Testes `llm` só rodam quando a expressão `-m` cita `llm`. Um `-m` na linha de comando substitui
+  o `-m 'not llm'` do addopts; sem esta trava, `pytest -m "not realdb"` gastaria cota.
 """
 
 from __future__ import annotations
 
+import re
 import socket
 from pathlib import Path
 
@@ -18,6 +21,22 @@ import pytest
 from pydantic_ai import models
 
 from cinedata.config import ALL_ENV_VARS
+
+_LLM_IN_EXPRESSION = re.compile(r"\bllm\b")
+
+
+def llm_tests_requested(markexpr: str | None) -> bool:
+    """True só quando a expressão `-m` cita o marcador `llm` (pedido explícito de gastar cota)."""
+    return bool(markexpr and _LLM_IN_EXPRESSION.search(markexpr))
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if llm_tests_requested(config.getoption("markexpr")):
+        return
+    skip = pytest.mark.skip(reason="LLM real, consome cota: rode só com -m llm")
+    for item in items:
+        if item.get_closest_marker("llm"):
+            item.add_marker(skip)
 
 
 @pytest.fixture(autouse=True)
