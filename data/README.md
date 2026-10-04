@@ -6,7 +6,8 @@ Coloque aqui o banco da atividade com o nome **`cinerocket.db`** (`data/cinerock
   auxiliares do SQLite) em qualquer pasta do repositório.
 - Se o download vier com um sufixo como `cinerocket (1).db` (acontece quando o arquivo é baixado
   mais de uma vez), renomeie para `cinerocket.db`. Para usar outro nome ou outra pasta, defina
-  `CINEDATA_DB_PATH` no `.env`.
+  `CINEDATA_DB_PATH` no `.env`. Os testes `realdb` não leem essa variável: eles usam sempre
+  `data/cinerocket.db` e são pulados quando o arquivo não está aqui.
 - O banco usa o modo WAL. Ao abri-lo em modo somente leitura, o SQLite pode criar ao lado dele os
   arquivos auxiliares `cinerocket.db-wal` e `cinerocket.db-shm`. Isso é normal, e eles também
   estão ignorados pelo `.gitignore`.

@@ -1,184 +1,279 @@
 # CineData Agent
 
-Agente que responde, em linguagem natural, perguntas sobre o catálogo de filmes da CineData
-Analytics. Ele consulta a camada Gold (SQLite) por Text-to-SQL e **somente em modo leitura**.
-Projeto da atividade GenAI do Rocket Lab 2026.2.
+Agente que responde, em linguagem natural, perguntas analíticas sobre o catálogo de filmes da
+CineData Analytics. Ele gera SQL livre (Text-to-SQL) sobre a camada Gold, um banco SQLite, executa
+a consulta **somente em modo leitura** e responde em português. É uma ferramenta de linha de
+comando, sem frontend. Projeto da atividade GenAI do Rocket Lab 2026.2.
 
-> **Status: marco M2 (agente).** O agente responde perguntas livres pela CLI (`cinedata ask`),
-> sobre o `SafeDatabase` (a única porta de entrada para o banco), o `EntityIndex` (resolução de
-> filmes, pessoas, gêneros e produtoras) e os casos de referência do M1c (gabarito, usado só na
-> avaliação). A orquestração foi testada offline e no banco real com modelo roteirizado, e o
-> primeiro smoke test com LLM real passou em 2026-10-02 com `qwen/qwen3.8-27b:free` (ver
-> "Modelo" em Configuração). A suíte de avaliação ampla é o marco M3.
+- **Text-to-SQL livre:** o modelo recebe o esquema da Gold e escreve o SQL de cada pergunta. Não há
+  lista de perguntas aceitas, roteamento por intenção nem SQL pronto.
+- **Somente leitura por construção:** todo acesso ao banco passa pelo `SafeDatabase`, que abre o
+  arquivo em modo leitura e nega por padrão tudo que não seja ler as tabelas da Gold.
+- **Respostas fundamentadas:** uma resposta com dados só é aceita depois de o modelo ter lido o
+  resultado de uma consulta real; um nome ambíguo vira pedido de esclarecimento.
+- **Rastreável:** `--show-sql` e `--json` mostram o SQL executado, as linhas, os tempos e os
+  modelos que responderam, a partir do rastro da aplicação (nunca do texto do modelo).
+- **Avaliação determinística:** 26 casos pontuados por código, sem LLM-juiz. Só o tier `smoke`
+  (4 casos) foi executado com modelo real; não há taxa sobre o corpus (ver [Avaliação](#avaliação)).
+
+## Escopo
+
+O enunciado traz 14 perguntas em "Categorias de Perguntas e Exemplos (Não exaustivo)". Elas são
+tratadas como o que são: **exemplos oficiais e não exaustivos**.
+
+- O agente responde perguntas analíticas livres sobre a Gold. Ele não foi construído como 14
+  intenções nem como 14 handlers de SQL e não precisa reconhecer nenhuma delas.
+- Os 14 exemplos têm uma semântica aprovada e um SQL de referência (`src/cinedata/reference.py`),
+  usados **só na avaliação**, como benchmark oficial mínimo. Testes garantem que o agente não
+  carrega esse módulo e que nenhuma pergunta ou SQL de referência entra nas instruções do modelo.
+- A avaliação acrescenta paráfrases, perguntas novas e casos de comportamento, para medir
+  generalização além dos exemplos.
+
+## Arquitetura
+
+```text
+pergunta em linguagem natural
+        │
+        ▼
+agente PydanticAI ──── instruções: esquema Gold, relações, semântica do domínio, data de referência
+        │
+        ├── find_entities ──► EntityIndex: filmes, pessoas, gêneros e produtoras
+        │                     (só um nome exato e único resolve; o resto volta como candidatos)
+        │
+        ├── run_sql ────────► SafeDatabase: validação e execução somente leitura
+        │                              │
+        │                              ▼
+        │                     cinerocket.db (camada Gold, SQLite)
+        ▼
+final_answer ──── validada em código (fundamentação e ambiguidade)
+        │
+        ▼
+resposta em português + rastro da aplicação (SQL, linhas, tempos, modelo, uso)
+```
+
+| Componente | Arquivo | Responsabilidade |
+|---|---|---|
+| Configuração | `src/cinedata/config.py` | Lê o ambiente e o `.env`, valida os valores e calcula a janela de datas. |
+| `SafeDatabase` | `src/cinedata/db.py` | Único caminho até o banco: abertura somente leitura, authorizer e limites. |
+| `EntityIndex` | `src/cinedata/entities.py` | Resolução de nomes com estados explícitos (exato, homônimos, parcial, fuzzy). |
+| Instruções | `src/cinedata/prompt.py` | Esquema gerado da allowlist do `SafeDatabase`, mais a semântica do domínio. |
+| Agente | `src/cinedata/agent.py` | Ferramentas `find_entities` e `run_sql`, validação da resposta e limites por pergunta. |
+| Rastro | `src/cinedata/runtime.py` | Resposta tipada do modelo, rastro escrito só pelo código, falhas e avisos. |
+| Provedor | `src/cinedata/llm.py` | Cliente do OpenRouter, fallback seletivo e tradução das falhas HTTP. |
+| CLI | `src/cinedata/cli.py` | Comandos `doctor` e `ask`. |
+| Referência | `src/cinedata/reference.py` | Gabarito dos 14 exemplos oficiais (só avaliação e testes). |
+| Avaliação | `evals/` | Corpus, pontuação determinística e executor (fora do pacote instalado). |
+
+Como uma pergunta é respondida:
+
+1. O modelo recebe a pergunta e as instruções. O esquema vem da própria allowlist do
+   `SafeDatabase`, então colunas ocultas nunca aparecem para ele.
+2. Para nomes citados na pergunta, ele chama `find_entities`. Só `exact_unique` resolve; homônimos,
+   correspondências parciais e sugestões fuzzy voltam como candidatos, com ano e `id_filme` (filmes)
+   ou papel (pessoas).
+3. Ele escreve o SQL e chama `run_sql(sql)`. A ferramenta só tem esse parâmetro: teto de linhas,
+   prazo, conexão e authorizer vêm da configuração, nunca do modelo.
+4. Ele termina com `final_answer`: um status (`data_answer`, `clarification`, `info` ou
+   `out_of_scope`), o texto, premissas e ressalvas. O código recusa a resposta, e devolve o motivo
+   ao modelo dentro do orçamento da pergunta, quando:
+   - um `data_answer` não tem uma consulta bem-sucedida lida numa requisição anterior;
+   - a resposta final veio na mesma resposta do modelo que pediu `run_sql` ou `find_entities` (o
+     texto foi escrito sem ver o resultado);
+   - uma consulta usou um candidato de uma busca não resolvida sem que o código prove a escolha
+     (um ano ou `id_filme` escrito na pergunta que identifique um candidato só ou, entre
+     homônimos, uma resposta que cubra todos). Sugestão fuzzy nunca vale. O caminho, então, é
+     pedir esclarecimento.
+5. A aplicação anexa avisos próprios (resultado truncado, zero linhas, candidato escolhido entre
+   homônimos) e o rastro (`RunTrace`), que o modelo não escreve.
+
+A fundamentação prova que a resposta veio depois de dados reais, não que o SQL era o certo. Isso
+é o que a avaliação mede.
+
+## Segurança e limites
+
+A segurança do banco não depende do prompt nem de analisar o texto do SQL. Ela vem de camadas
+independentes do `SafeDatabase`, e cada uma tem testes que a exercitam sozinha:
+
+1. **Abertura somente leitura** (`mode=ro`), com `query_only` como reforço.
+2. **Configuração endurecida e conferida por releitura:** `DEFENSIVE` ligado, `TRUSTED_SCHEMA`
+   desligado e aspas duplas que nunca viram texto (DQS desligado). Se a build do SQLite não
+   oferecer alguma dessas proteções, o banco não abre.
+3. **Limites do SQLite:** `ATTACH` fechado (`SQLITE_LIMIT_ATTACHED=0`, que também bloqueia
+   `VACUUM INTO`), SQL de até 20 KB e tetos de colunas, profundidade de expressão e `UNION`s.
+4. **Authorizer com negação por padrão:** só leitura das 10 tabelas da Gold, das colunas
+   permitidas e de funções de uma lista fechada. Escrita, DDL, `PRAGMA`, `ATTACH`, transações,
+   consultas recursivas e `CURRENT_DATE`/`CURRENT_TIME`/`CURRENT_TIMESTAMP` são negados. Ficam
+   ocultos `sqlite_master`, `alembic_version` e o nome de quem avaliou (`movie_reviews.name`).
+5. **Prazo e tamanho do resultado:** prazo por consulta (padrão 30 s), teto de linhas (padrão 50)
+   e de tamanho de célula, sem reescrever o SQL. Um resultado truncado é marcado e avisado.
+
+Além disso, um pré-filtro aceita só `SELECT` e `WITH`, e cada pergunta tem orçamento próprio:
+requisições ao modelo (`CINEDATA_REQUEST_LIMIT`), 6 consultas, 8 buscas de entidade e 2 prazos
+estourados; um SQL idêntico a um que já falhou não roda de novo.
+
+**Provedor.** O cliente do OpenRouter tem prazo de 120 s por requisição e **nenhuma retentativa
+automática** do SDK. Os modelos de fallback, se configurados, entram só em falhas transitórias
+(HTTP 408, 429, 5xx ou falha de conexão); 400, 401, 402, 403, 404, 413 e 422 viram erro claro.
+Cabeçalhos que o SDK da OpenAI herdaria do ambiente são removidos: a requisição leva só a chave do
+OpenRouter.
+
+**Segredos.** A chave fica no `.env`, ignorado pelo Git, e nunca aparece em `repr`, mensagens de
+erro, `doctor` ou arquivos da avaliação. Bancos SQLite (`*.db`, `-wal`, `-shm`) e resultados
+brutos da avaliação também são ignorados. O `.env.example` traz só nomes e valores padrão.
+
+**O que não é garantido.**
+
+- O authorizer vê o nome da função, não o argumento: `date('now')` passa pelo `SafeDatabase`. O
+  agente recusa as formas comuns de ler o relógio do SQLite, mas esse filtro de texto é
+  incompleto e serve à reprodutibilidade, não à segurança (ler o relógio não escreve nada).
+- As linhas consultadas vão para o provedor do modelo, como em qualquer Text-to-SQL com LLM remoto.
+- Não há pretensão de sandbox perfeito: as garantias são as das camadas acima e dos testes que as
+  exercitam.
 
 ## Requisitos
 
-- Python 3.12 ou superior
-- SQLite 3.31 ou superior (já vem com o Python; ver a nota abaixo)
-- Git
-- O arquivo `cinerocket.db` da atividade e uma chave do [OpenRouter](https://openrouter.ai/keys)
-  (o banco é necessário para os testes `realdb`; a chave, a partir do agente)
-
-**Nota sobre as versões.** O acesso ao banco usa `Connection.setconfig`, que só existe a partir do
-Python 3.12, e opções do SQLite que só existem a partir da 3.31 (`DEFENSIVE` na 3.26, `DQS_*` na
-3.29 e `TRUSTED_SCHEMA` na 3.31). Em vez de confiar só na versão, o `SafeDatabase` confere cada
-proteção ao abrir o banco e **se recusa a funcionar** se a build não a oferecer. A execução real foi
-validada em Python 3.14.3 com SQLite 3.50.4. O piso 3.12 é sustentado pela documentação oficial e
-pela resolução de dependências, mas a suíte ainda não foi executada em 3.12.
+- **Python 3.12 ou superior.** Desenvolvido e testado com Python 3.14.3 e SQLite 3.50.4; as
+  versões 3.12 e 3.13 não foram exercitadas. O piso vem de `sqlite3.Connection.setconfig`, e o
+  SQLite embutido precisa ser 3.31 ou superior (o `SafeDatabase` confere cada proteção ao abrir).
+- **O banco da atividade,** `cinerocket.db` (cerca de 581 MB, não versionado).
+- **Uma chave do [OpenRouter](https://openrouter.ai/keys), só para chamadas reais ao modelo:**
+  `cinedata ask`, `pytest -m llm` e `python -m evals.run --live`. Instalação, `doctor`, testes
+  padrão e o dry-run da avaliação não precisam dela.
+- Acesso ao PyPI durante a instalação.
 
 ## Instalação
 
-Execute na raiz do repositório. Os comandos abaixo são para o Git Bash no Windows; as
-alternativas vêm logo depois.
+Na raiz do repositório, crie o ambiente virtual:
 
 ```bash
-py -m venv .venv
-source .venv/Scripts/activate
+python -m venv .venv
+```
+
+Ative-o conforme o shell:
+
+| Shell | Comando |
+|---|---|
+| PowerShell (Windows) | `.venv\Scripts\Activate.ps1` |
+| Git Bash (Windows) | `source .venv/Scripts/activate` |
+| bash ou zsh (Linux, macOS) | `source .venv/bin/activate` |
+
+Com o ambiente ativo, instale, crie o `.env` e confira:
+
+```bash
 python -m pip install -e ".[dev]" -c constraints.txt
+cp .env.example .env
+cinedata doctor
 ```
 
-O `-c constraints.txt` instala exatamente as versões testadas (o arquivo é gerado por comando,
-nunca editado à mão):
+- No Windows, se `python` não for encontrado ou abrir a Microsoft Store, crie o ambiente com
+  `py -m venv .venv`; depois de ativado, `python` já é o do ambiente. No Linux e no macOS, use
+  `python3` se esse for o nome do Python 3. No `cmd.exe`, troque `cp` por `copy`.
+- Se o PowerShell recusar o script de ativação ("execução de scripts foi desabilitada"), libere-o
+  só na sessão atual com `Set-ExecutionPolicy -Scope Process RemoteSigned` e ative de novo.
+- `-c constraints.txt` instala exatamente as versões testadas. O arquivo foi gerado no Windows com
+  `pip freeze --exclude-editable`; o pip ignora pacotes que a sua plataforma não usa (como
+  `colorama`).
+- `[dev]` acrescenta `pytest` e `ruff`. Para só usar o agente, `python -m pip install -e . -c
+  constraints.txt` basta.
+- Se o shell não encontrar `cinedata`, ative o ambiente ou use `python -m cinedata`.
 
-```bash
-python -m pip install -e ".[dev]"
-python -m pip freeze --exclude-editable > constraints.txt
-```
+### Banco de dados
 
-Alternativas:
-
-- **PowerShell:** ative com `.venv\Scripts\Activate.ps1`. Para gerar o `constraints.txt`, troque
-  o `>` por `| Set-Content -Encoding ascii constraints.txt` (o `>` do PowerShell 5.1 grava UTF-16 e
-  o pip não o lê).
-- **Linux/macOS:** `python3 -m venv .venv` e `source .venv/bin/activate`. O `constraints.txt`
-  gerado no Windows inclui pacotes só desse sistema (como `colorama`); o pip ignora os que não
-  são necessários na sua máquina.
+Coloque o banco em `data/cinerocket.db` ou aponte `CINEDATA_DB_PATH` para ele. Se o download vier
+como `cinerocket (1).db`, renomeie o arquivo (o `doctor` aponta isso). Ao abrir o banco, o SQLite
+pode criar `cinerocket.db-wal` e `cinerocket.db-shm` ao lado dele; é normal, e o Git os ignora. O
+arquivo do banco nunca é modificado (um teste `realdb` confere). Mais em
+[`data/README.md`](data/README.md).
 
 ## Configuração
 
+O `.env` é lido da pasta atual, então execute os comandos na raiz do repositório.
+
+| Variável | Necessária para | Padrão | Descrição |
+|---|---|---|---|
+| `OPENROUTER_API_KEY` | chamadas reais ao modelo | (vazio) | Chave do OpenRouter; começa com `sk-or-v1-`. |
+| `CINEDATA_MODEL` | chamadas reais ao modelo | (vazio) | Id no OpenRouter (`provedor/modelo` ou `provedor/modelo:variante`), com suporte a tool calling. O `.env.example` recomenda `openrouter/free`. |
+| `CINEDATA_FALLBACK_MODELS` | opcional | (vazio) | Até 2 modelos, separados por vírgula, usados só em falhas transitórias do provedor. |
+| `CINEDATA_DB_PATH` | opcional | `data/cinerocket.db` | Caminho do banco (relativo à pasta atual ou absoluto). |
+| `CINEDATA_MAX_ROWS` | opcional | `50` | Máximo de linhas devolvidas por consulta (1 a 200). |
+| `CINEDATA_SQL_TIMEOUT_S` | opcional | `30` | Prazo de uma consulta, em segundos (1 a 300). |
+| `CINEDATA_REQUEST_LIMIT` | opcional | `5` | Máximo de requisições ao modelo por pergunta (1 a 20). |
+| `CINEDATA_REFERENCE_DATE` | avaliação real | data de hoje | Data (`AAAA-MM-DD`) que ancora "últimos N anos". |
+
+- Variáveis do ambiente têm prioridade sobre o `.env`. Valores vazios contam como "não definido",
+  então uma variável de ambiente vazia **não** anula um valor do `.env`.
+- O código não tem modelo padrão: qualquer id do [catálogo](https://openrouter.ai/models) com
+  suporte a *tool calling* serve (o agente só funciona chamando ferramentas). Há duas formas de
+  configurar:
+  - **`openrouter/free` (recomendado, custo zero):** não é um modelo, e sim o roteador gratuito do
+    OpenRouter. Cada requisição pode ser atendida por um modelo gratuito compatível diferente, o
+    que dá mais disponibilidade do que depender de um endpoint gratuito só; em troca, a
+    composição de modelos varia entre requisições e entre execuções.
+  - **Um modelo fixo** (por exemplo `qwen/qwen3.8-27b:free`): use quando a reprodutibilidade ou a
+    comparação no nível do modelo importar. Um endpoint gratuito específico pode estar com limite
+    de uso (HTTP 429) com mais frequência.
+
+  Em qualquer caso, o rastro registra os modelos que de fato responderam (`models_used`).
+  Capacidade anunciada no catálogo não garante qualidade como agente: meça com a avaliação.
+- Com fallback, cada requisição do agente pode virar até 1 + (nº de fallbacks) chamadas HTTP. Deixe
+  `CINEDATA_FALLBACK_MODELS` vazio num primeiro uso controlado.
+- "Últimos N anos" é uma janela móvel que termina na data de referência, com os dois extremos
+  incluídos (29/fev vira 28/fev quando o ano de destino não é bissexto). Sem
+  `CINEDATA_REFERENCE_DATE`, vale a data de hoje e as respostas mudam com o tempo; fixe uma data
+  para resultados reproduzíveis.
+
+### Diagnóstico offline
+
+`cinedata doctor` mostra a configuração efetiva e confere o arquivo do banco (existência, leitura e
+cabeçalho SQLite), sem acessar a rede e sem imprimir a chave. Ele separa **pendências**, que
+impedem o uso (código de saída 1), de **avisos**, que pedem conferência mas não bloqueiam (código
+0). Um valor inválido, como `CINEDATA_MAX_ROWS=abc`, é reportado com o nome da variável e código 2.
+
+## Uso
+
 ```bash
-cp .env.example .env
+cinedata --help
+cinedata ask --help
+cinedata doctor
+cinedata ask "Quais diretores têm mais filmes de Animação lançados a partir de 2010?"
+cinedata ask --show-sql "Qual é a receita média em reais dos filmes de Terror por década?"
+cinedata ask --json "Qual é a nota IMDb do filme Elemental?"
 ```
 
-Edite o `.env`. Valores vazios contam como "não definido", e variáveis do ambiente têm prioridade
-sobre o `.env`. O `.env` é lido da pasta atual, por isso execute os comandos na raiz do
-repositório.
+Cada `ask` consome cota do provedor. A saída traz a resposta, as premissas, as ressalvas, os
+avisos do sistema e um rodapé com o tipo da resposta, o modelo que respondeu e o número de
+respostas recebidas do modelo.
 
-| Variável | Padrão | Descrição |
-|---|---|---|
-| `OPENROUTER_API_KEY` | (vazio) | Chave do OpenRouter; começa com `sk-or-v1-`. |
-| `CINEDATA_MODEL` | (vazio) | Id do modelo no OpenRouter (`provedor/modelo` ou `provedor/modelo:variante`). |
-| `CINEDATA_FALLBACK_MODELS` | (vazio) | Até 2 modelos de fallback, separados por vírgula. |
-| `CINEDATA_DB_PATH` | `data/cinerocket.db` | Caminho do banco SQLite (relativo à pasta atual ou absoluto). |
-| `CINEDATA_MAX_ROWS` | `50` | Máximo de linhas devolvidas por consulta (1 a 200). |
-| `CINEDATA_SQL_TIMEOUT_S` | `30` | Tempo máximo de uma consulta SQL, em segundos (1 a 300). |
-| `CINEDATA_REQUEST_LIMIT` | `5` | Máximo de requisições do agente ao modelo por pergunta (1 a 20); com fallback, as chamadas HTTP podem ser mais. |
-| `CINEDATA_REFERENCE_DATE` | hoje | Data de referência (`AAAA-MM-DD`) para "últimos N anos". |
+- `--show-sql` lista o SQL **do rastro da aplicação**, com status, linhas e tempo de cada
+  consulta, nunca um SQL escrito no texto do modelo.
+- `--json` separa `answer` (escrito pelo modelo) de `runtime` e `notices` (escritos pela
+  aplicação): consultas, buscas de entidade, modelos, tokens e tempo.
+- Caracteres de controle vindos do banco ou do modelo são removidos da saída do terminal.
 
-**Modelo:** o modelo principal validado é `qwen/qwen3.8-27b:free` (2026-10-02), o valor de
-`CINEDATA_MODEL` no `.env.example`. No primeiro smoke test real com modelo fixo
-(`test_top_revenue_with_a_synonym`, sem fallback configurado), o agente usou 2 respostas do
-modelo e 1 chamada `run_sql`, sem recusas nem fallback, e o resultado conferiu com o oráculo
-independente. O código não fixa modelo nenhum: a disponibilidade de modelos gratuitos muda com
-frequência, então `CINEDATA_MODEL` continua configurável. Para trocar, use um id do
-[catálogo do OpenRouter](https://openrouter.ai/models) com suporte a *tool calling* (o agente só
-funciona chamando ferramentas); capacidade anunciada no catálogo não garante qualidade como agente.
+Outros exemplos de perguntas (ilustrativos, não uma lista do que é aceito): "Top 10 filmes com
+maior receita em R$", "Quais atores mais trabalharam com Christopher Nolan?", "Quantos filmes
+lançados nos últimos 3 anos têm nota IMDb acima de 7?" e "O que você sabe responder?".
 
-**Data de referência:** a janela de "últimos 5 anos" é móvel e vai de cinco anos antes da data de
-referência até ela, com os dois extremos incluídos (29/fev vira 28/fev quando o ano de destino
-não é bissexto). Fixe `CINEDATA_REFERENCE_DATE` para obter resultados reproduzíveis.
+| Código de saída | Significado |
+|---|---|
+| 0 | `doctor` sem pendências (pode listar avisos), `--version`/`--help`, ou o `ask` respondeu (inclusive com pedido de esclarecimento ou recusa fora do escopo). |
+| 1 | O `doctor` encontrou pendências, ou o `ask` não conseguiu responder (provedor, banco, limites do agente). |
+| 2 | Uso ou configuração inválidos (inclusive chave ou modelo ausentes no `ask`). |
+| 130 | Interrompido com Ctrl+C. |
 
-## Banco de dados
+Se os acentos aparecerem corrompidos no terminal, defina `PYTHONUTF8=1` (ou
+`PYTHONIOENCODING=utf-8`) e rode o comando de novo. A saída redirecionada já sai em UTF-8.
 
-Coloque o banco da atividade em `data/cinerocket.db` (cerca de 581 MB, **não versionado**). Se o
-download vier com um sufixo como `cinerocket (1).db`, renomeie o arquivo para `cinerocket.db`.
-Detalhes em [`data/README.md`](data/README.md).
+## Avaliação
 
-## Segurança do acesso ao banco
+### Gabarito dos exemplos oficiais
 
-Todo acesso passa por `SafeDatabase` (`src/cinedata/db.py`). A segurança não depende do prompt nem
-de analisar o texto do SQL: ela vem de camadas independentes, e cada uma tem testes que a exercitam
-sozinha.
-
-1. **Abertura somente leitura** (`mode=ro`), com a URI montada por `Path.as_uri()`.
-2. **Limites do SQLite**, incluindo `SQLITE_LIMIT_ATTACHED=0`, que fecha `ATTACH` e `VACUUM INTO`
-   (eles poderiam criar arquivos mesmo com `mode=ro`).
-3. **Configuração endurecida e conferida por releitura:** aspas duplas nunca viram texto em silêncio
-   (DQS desligado), `DEFENSIVE` ligado, `TRUSTED_SCHEMA` desligado, `query_only` e cache de 64 MB.
-   Se a build não oferecer alguma proteção, o banco não abre.
-4. **Authorizer com negação por padrão:** só leitura das 10 tabelas da Gold e de colunas
-   permitidas (fica de fora `alembic_version`, `sqlite_master` e `movie_reviews.name`, o nome de
-   quem avaliou) e só funções de uma lista fechada. Escrita, DDL, `PRAGMA`, `ATTACH`, transações,
-   consultas recursivas e `CURRENT_DATE`/`CURRENT_TIME`/`CURRENT_TIMESTAMP` são negados.
-5. **Prazo** por *progress handler* (padrão 30 s) e **limite de linhas** por `fetchmany(max_rows + 1)`,
-   sem reescrever o SQL. Um Ctrl+C durante a consulta é repassado como `KeyboardInterrupt`.
-
-Um pré-filtro de texto restringe as consultas a `SELECT` ou `WITH` e também melhora as mensagens
-de erro. Mesmo sem ele, as demais camadas continuam garantindo o acesso somente leitura e
-bloqueando operações fora da política de segurança.
-
-**Lacunas conhecidas.** O authorizer vê o nome da função, não o argumento; por isso `date('now')`,
-`date()` e formas parecidas passam pelo `SafeDatabase`. No agente, `run_sql` recusa as formas
-diretas e comuns de ler o relógio do SQLite (`'now'`, `'subsec'`/`'subsecond'` como valor de
-tempo e funções de data sem argumento) como proteção de reprodutibilidade. Esse filtro de texto é
-incompleto (`date('n' || 'ow')` passa, e um teste documenta isso) e não é uma fronteira de
-segurança: a semântica da data de referência é garantida pelas instruções e pela avaliação (M3).
-O Ctrl+C durante uma consulta do agente interrompe na hora: as ferramentas chamam o banco na
-thread principal (ver "Agente").
-
-**Cargas internas grandes.** `execute(sql, max_rows=..., timeout_s=...)` aceita um teto de linhas
-e um prazo só para aquela chamada, com limites máximos. Serve ao índice de entidades (424 mil
-pessoas) na MESMA conexão, com o mesmo authorizer e as mesmas allowlists. Esses parâmetros nunca
-são expostos ao modelo.
-
-## Resolução de entidades
-
-`EntityIndex` (`src/cinedata/entities.py`) transforma um texto livre em entidades do banco.
-`find(tipo, texto, role=None)` devolve um destes estados:
-
-| Estado | Quando | Resolve? |
-|---|---|---|
-| `exact_unique` | exatamente uma entidade tem o nome (sem maiúsculas, acentos nem pontuação) | sim |
-| `exact_multiple` | duas ou mais têm o mesmo nome: homônimos nunca são fundidos | não |
-| `partial_candidates` | sem nome exato; prefixo ou tokens do texto em outros nomes | não, nunca |
-| `fuzzy_suggestions` | sem parcial; nomes a 1 ou 2 edições por token | não, só sugere |
-| `none` | nada achado, ou texto vazio, longo demais ou inválido (`reason` diz qual) | |
-
-Cada candidato traz desambiguadores: filme = título, ano e `id_filme`; pessoa = nome e papel
-(`Diretor`, `Ator`, `Roteirista`); gênero e produtora = nome. Em `dim_people` cada papel é uma linha
-própria, então um nome sem `role` costuma dar `exact_multiple`. Os gêneros também respondem em
-português (Ação, Terror, Suspense, Ficção científica, Cinema TV...). A ordem dos candidatos é
-determinística e não depende da ordem do banco. Cada tipo é carregado na primeira busca que o
-usa, e uma carga que falhe, seja truncada ou venha vazia nunca deixa um índice parcial.
-
-**Limite conhecido do fuzzy.** Ele só sugere e tem recall limitado: com 1 edição por token a
-vizinhança é completa; com 2 (tokens de 6 letras ou mais), um token errado na primeira E na última
-letra ao mesmo tempo não é encontrado.
-
-## Casos de referência (gabarito)
-
-`src/cinedata/reference.py` guarda a semântica aprovada e um SQL confiável e legível para as 14
-perguntas do enunciado ("Categorias de Perguntas e Exemplos (Não exaustivo)"). Elas são **exemplos
-oficiais e não exaustivos**: formam o conjunto mínimo de referência da avaliação, não a lista do
-que o agente responde. O agente (M2) vai gerar SQL livre sobre o esquema Gold para qualquer
-pergunta analítica válida e não depende de reconhecer um destes casos; eles servem para validar e
-avaliar respostas (M3), nunca como roteador de intenções.
-
-- Um caso (`ReferenceCase`) é um dado: id estável, pergunta, semântica, SQL, parâmetros (N de
-  exibição, janela em anos) e as colunas esperadas. `run_case` executa qualquer caso pelo
-  `SafeDatabase`, com o prazo normal, e recusa resultado truncado, colunas inesperadas ou chave
-  repetida. Paráfrases e perguntas novas entram com `ReferenceRegistry.register`, sem mudar o
-  executor (um teste registra um 15º caso).
-- Rankings usam `RANK()`: os empatados no corte do top-N entram (o resultado pode passar de N
-  linhas), e "o maior" devolve todos os líderes empatados.
-- Métricas calculadas são arredondadas antes de ranquear (dinheiro em 2 casas, notas em 9,
-  margens em 12), para que valores iguais empatem apesar do ponto flutuante. Um teste confere, no
-  banco inteiro, que isso empata os valores exatamente iguais e só eles.
-- "Últimos 5 anos" usa a data de referência do projeto (`CINEDATA_REFERENCE_DATE`), nunca o
-  relógio do SQLite. O gabarito do banco real usa 2026-10-01 (janela de 2021-10-01 a 2026-10-01).
-
-A pergunta de cada caso (`question`) é a redação literal do enunciado; reformulações ficam em
-`paraphrases`.
+`src/cinedata/reference.py` guarda, para cada um dos 14 exemplos, a pergunta literal do enunciado,
+a semântica aprovada e um SQL legível que serve de gabarito. O executor é genérico: um caso é um
+dado, e paráfrases ou perguntas novas entram por registro, sem código novo. Os 14 SQLs são
+conferidos offline contra um oráculo independente em Python, com aritmética exata, em bancos
+sintéticos aleatórios (`tests/test_reference.py`), e no banco real inteiro
+(`tests/test_reference_realdb.py`).
 
 | # | Pergunta (enunciado) | Decisões principais |
 |---|---|---|
@@ -197,233 +292,192 @@ A pergunta de cada caso (`question`) é a redação literal do enunciado; reform
 | 13 | Filmes mais avaliados pelos usuários | `dim_reviews.qtd_avaliacoes_usuarios`; top 10 |
 | 14 | Filmes em que a nota média dos usuários mais diverge da nota IMDb | média de usuários existente e IMDb > 0; top 10 |
 
-Quando o enunciado não fixa N, o top 10 é decisão de exibição. Os empates no corte também valem
-para os N do enunciado (01 e 04), embora no banco real eles não ocorram ali.
+Convenções comuns: quando o enunciado não fixa N, o top 10 é decisão de exibição; rankings usam
+`RANK()`, então os empatados no corte entram e "o maior" devolve todos os líderes empatados;
+métricas calculadas são arredondadas antes de ranquear (dinheiro em 2 casas, notas em 9, margens
+em 12), para que valores iguais empatem apesar do ponto flutuante; "últimos 5 anos" usa a data de
+referência do projeto, nunca o relógio do SQLite.
 
-**Ressalvas encontradas no banco real.**
+Particularidades do banco real que orientaram essas decisões:
 
-- O lucro da Gold existe mesmo com um lado faltando: sem orçamento, lucro = receita; sem receita,
-  lucro = −orçamento. O caso 02 segue o enunciado (exige só a receita) e o 11 soma esse lucro.
-- Receita e orçamento ficam ora em INTEGER, ora em REAL, e a divisão entre inteiros do SQLite
-  zera a margem; por isso o `CAST(... AS REAL)`. O binário também separa valores iguais: as
-  margens de "Bad Ben" e "Bad Ben: The Mandela Effect" são exatamente 1097/1100, mas o REAL difere
-  na última casa (com o arredondamento, empatam em 9º lugar). Já duas margens diferentes chegam a
-  diferir só na 11ª casa (7/8 e 0,87499999996), por isso margens usam 12 casas, e não 9.
-- 102 notas TMDB vêm com ruído binário (6,903999999999999 no lugar de 6,904).
-- A margem média por gênero (12) é dominada por receitas ínfimas: todos os gêneros têm média
-  negativa, e o líder, War, tem −5,35 (−535%).
-- Há `popularidade` igual a um ano do título ("La Fellinette" = 2020, "Wwe Survivor Series 2018"
-  = 2018); como aprovado, esses valores ficam no caso 04.
-- Linhas de `Diretor` incluem nomes que não são pessoas ("English", "Documentary", "Drama"); nenhum
-  aparece nos gabaritos 08 e 09.
-- Títulos se repetem (os mais avaliados são quase todos "Die Hart" com ids diferentes), por isso
-  todo resultado de filme traz `id_filme` como chave. Neste banco, os 95.645 filmes têm
-  `id_filme` distinto e não nulo (invariante verificado por um teste `realdb`), e `run_case`
-  recusa qualquer resultado com chave repetida.
-- Cruzar todo o elenco com toda a direção (caso 09) levou de 15 s a mais de 2 min, conforme a
-  formulação. O SQL de referência usa uma poda exata (um par não tem mais filmes juntos do que
-  cada pessoa tem sozinha) e roda em cerca de 2 s. Com o cache do sistema quente, os 14 casos
-  levam de 0,02 a 2,1 s; na primeira execução, com a máquina carregada, o mais lento (07) chegou
-  a 14 s, abaixo do prazo padrão de 30 s.
+- O lucro da Gold existe mesmo com um lado faltando (sem orçamento, lucro = receita; sem receita,
+  lucro = −orçamento). O caso 02 exige a receita, como o enunciado; o 11 soma esse lucro.
+- Receita e orçamento ficam ora em INTEGER, ora em REAL, e a divisão inteira do SQLite zeraria a
+  margem; por isso o `CAST(... AS REAL)`.
+- Títulos se repetem (os filmes mais avaliados são quase todos "Die Hart", com ids diferentes), por
+  isso todo resultado de filme carrega `id_filme` como chave.
+- Há `popularidade` igual ao ano do título e linhas de `Diretor` que não são pessoas
+  ("Documentary", "Drama"); os dados são usados como estão.
+- A margem média por gênero (caso 12) é negativa em todos os gêneros, dominada por receitas ínfimas.
 
+### Corpus e pontuação
 
-## Agente (M2)
+`evals/` mede se o agente responde certo, sem LLM-juiz e sem gastar cota para pontuar. A
+especificação completa da pontuação está em [`evals/README.md`](evals/README.md).
 
-Um agente PydanticAI com **duas ferramentas** visíveis ao modelo, sem multiagentes, RAG nem cache:
+| Categoria | Casos | Papel |
+|---|---|---|
+| `official` | 14 | Os exemplos do enunciado, lidos do gabarito acima, sem cópia. |
+| `paraphrase` | 5 | Variações de linguagem de exemplos oficiais (sinônimo, registro informal, sem acentos, singular). |
+| `freeform` | 4 | Perguntas analíticas novas, sem caso oficial: atores de Terror, filmes de um diretor, receita em USD, janela de 3 anos. |
+| `policy` | 3 | Título ambíguo, pedido fora do escopo e pergunta sobre o próprio agente. |
 
-- `find_entities(kind, text, role?)`: envolve o `EntityIndex`. Devolve o estado, as chaves `sk_*`,
-  os desambiguadores (ano, `id_filme`, papel) e uma orientação.
-- `run_sql(sql)`: executa o SQL escrito pelo modelo por `SafeDatabase.execute(sql)`, com o teto de
-  linhas e o prazo da configuração. O modelo não controla limites, prazo, authorizer, conexão
-  nem caminhos (a ferramenta só tem o parâmetro `sql`; argumentos extras são recusados).
+- **Gabarito na hora:** calculado no mesmo banco e com a mesma data de referência do agente. As
+  perguntas livres têm gabaritos próprios, conferidos contra cálculos independentes em Python.
+- **SQL por resultado, não por texto:** o lado do agente vem do rastro. Uma consulta conta se
+  reproduz o gabarito por valor (aliases, colunas extras e ordem das colunas não importam; linhas
+  como multiconjunto; filme por `id_filme` ou título + ano; tolerâncias numéricas explícitas), se
+  o modelo a leu antes da resposta final e se não foi truncada. Rankings exigem todos os
+  empatados no corte do top N.
+- **Texto final:** cada linha exigida precisa aparecer com identidade e métrica principal, na
+  ordem do ranking, sem linhas inventadas em listas ou tabelas; um resultado vazio precisa ser dito.
+- **Política:** fora do escopo e ajuda sem nenhuma ferramenta de dados e com um texto mínimo;
+  título ambíguo com esclarecimento comprovado pela busca dos homônimos ou com a resposta completa
+  para todos eles.
+- **Falha do provedor não é falha semântica:** chave, crédito, moderação, modelo inexistente,
+  HTTP 408, 429, 5xx e falhas de conexão, assim como banco indisponível ou defeito do
+  pontuador, são **não avaliado** e ficam fora da taxa. Uma requisição recusada pelo provedor
+  (400, 413, 422), o limite de requisições ou uma falha de protocolo contam como falha do
+  conjunto modelo + agente.
 
-**Text-to-SQL livre.** As instruções (`src/cinedata/prompt.py`) trazem o esquema gerado da própria
-allowlist do `SafeDatabase` (colunas escondidas não aparecem), as relações (pontes N:N, um papel
-por linha em `dim_people`, `dim_reviews` como agregado de `movie_reviews`), a semântica do domínio
-(receita = faturamento = bilheteria, `*_brl` para reais, lucro da Gold com um lado faltando, IMDb
-≤ 0 = sem nota, TMDB 0 sem votos = sem nota, popularidade literal, nada de filtros não pedidos), a
-data de referência e regras de SQL. Os 14 exemplos do M1c **não** são usados pelo agente: nada de
-roteamento por intenção, nada de SQL de gabarito no prompt (testes verificam isso, inclusive que
-`cinedata.reference` nem é carregado). O gabarito serve à avaliação (M3).
+### Como executar
 
-**Resposta tipada.** O modelo termina com `final_answer`, que só tem conteúdo: `status`
-(`data_answer`, `clarification`, `info` ou `out_of_scope`), `answer`, `assumptions` e `caveats`. SQL
-executado, linhas, truncamento, tempos, modelo usado e uso vêm do rastro da aplicação
-(`RunTrace`), escrito só pelo código; campos extras mandados pelo modelo são descartados.
-
-**Fundamentação, aplicada em código.** `data_answer` só é aceito se o modelo já recebeu, numa
-requisição anterior, o resultado de uma consulta bem-sucedida (um `final_answer` mandado junto com
-o próprio SQL é recusado). A recusa vira um retry dentro do orçamento; insistir sem consultar
-encerra a pergunta com erro. Isso prova que a resposta veio depois de dados reais, não que o SQL
-era o certo (isso é papel da avaliação). A aplicação anexa avisos próprios: resultado truncado,
-textos cortados, zero linhas na última consulta e uso de um candidato que não tinha resolução
-única. Zero linhas é resultado (status `ok`); erro é outra coisa (`failed`, `rejected`, `timeout`).
-
-**Ambiguidade de entidades, aplicada em código.** Só `exact_unique` resolve. Se uma consulta
-bem-sucedida usar a chave `sk_*` de um candidato de busca não resolvida, o validador só aceita um
-`data_answer` quando o código prova a escolha (senão recusa e empurra para `clarification`; falha
-fechada):
-
-- `fuzzy_suggestions`: nunca, nem com ano na pergunta; exige um novo turno do usuário.
-- `partial_candidates`: só se um ano ou `id <número>` escrito na pergunta original identificar
-  exatamente um candidato (e todos os candidatos estiverem à vista).
-- `exact_multiple`: o mesmo, ou quando a resposta cobre todos os homônimos.
-- Pessoa por papel: resolvida chamando `find_entities` de novo com `role` (a mesma pessoa, agora
-  `exact_unique`); escolher a linha de um papel numa busca não resolvida é recusado.
-
-Não há NER nem análise semântica: os qualificadores aceitos são um ano de 4 dígitos e
-`id`/`id_filme` seguido de número. Uma escolha aceita sai com um aviso do sistema dizendo qual
-entidade foi usada e por quê.
-
-**Dados do banco são dados.** Títulos, sinopses e avaliações podem conter texto que parece
-instrução; as instruções mandam tratá-lo como dado. A fronteira de verdade continua sendo o
-`SafeDatabase` (somente leitura), mais os limites que o modelo não controla.
-
-**Limites por pergunta.** `CINEDATA_REQUEST_LIMIT` vira `UsageLimits(request_limit=...)` da
-biblioteca: ao atingir o limite, a pergunta termina com erro claro. Além disso: até 6 consultas
-(contando as que falham), até 8 buscas de entidade, até 2 consultas com prazo estourado, nenhum SQL
-idêntico a um que já falhou é executado de novo, 3 falhas seguidas da mesma ferramenta ou 3
-respostas finais inválidas encerram a pergunta, e o resultado enviado ao modelo tem teto de tamanho
-(o rastro guarda tudo).
-
-**OpenRouter.** O cliente é montado em `src/cinedata/llm.py` com a chave das `Settings`, prazo de
-120 s por requisição e **sem retentativas silenciosas do SDK** (o padrão seria repetir até 2 vezes
-e esperar até 600 s). Cabeçalhos herdados do ambiente pelo SDK da OpenAI (`OPENAI_ORG_ID`,
-`OPENAI_PROJECT_ID`, `OPENAI_CUSTOM_HEADERS`) são anulados: a requisição leva só a chave do
-OpenRouter. Os modelos de `CINEDATA_FALLBACK_MODELS` entram **só** em falhas transitórias: HTTP
-408, 429, qualquer 5xx (500 a 599) e falhas sem status (conexão, prazo, resposta vazia). 400, 401,
-402, 403, 404, 413 e 422 não trocam de modelo e viram erro com a categoria preservada. O fallback
-é por requisição do agente: cada uma pode fazer até 1 + (nº de fallbacks) chamadas HTTP, e o
-rastro mostra o modelo que de fato respondeu. As linhas devolvidas pelas consultas vão para o
-provedor do modelo, como em qualquer Text-to-SQL com LLM remoto.
-
-**O que é contado.** `CINEDATA_REQUEST_LIMIT` é o orçamento de requisições do agente
-(`UsageLimits` do PydanticAI). O rastro e a CLI mostram `model_responses`, as **respostas
-recebidas do modelo**. Isso não é a contagem de chamadas HTTP ao provedor: com fallback, as
-tentativas reais podem ser mais numerosas, e falhas não geram resposta. Não use esse número como
-medida exata de consumo de cota.
-
-## Comandos
+Na raiz do repositório (o pacote `evals` não é instalado; ele roda a partir dela):
 
 ```bash
-cinedata --version
-cinedata doctor
-cinedata ask "Qual gênero tem mais filmes com nota IMDb acima de 8?"
-cinedata ask --show-sql "Quais são os 5 filmes com maior faturamento?"
-cinedata ask --json "Qual é a nota IMDb do filme Elemental?"
-python -m cinedata doctor
+python -m evals.run --help
+python -m evals.run --tier smoke
+python -m evals.run --tier full --check-oracles
+python -m evals.run --tier smoke --primary-only --live
+python -m evals.run --tier smoke --primary-only --live --resume
 ```
 
-O `ask` imprime a resposta, as premissas, as ressalvas, os avisos do sistema e um rodapé com o tipo
-da resposta, o modelo usado e o número de respostas recebidas do modelo. `--show-sql` lista o SQL
-**do rastro da aplicação** (com status, linhas e tempo de cada consulta), nunca um texto escrito
-pelo modelo.
-`--json` separa `answer` (escrito pelo modelo) de `runtime` e `notices` (escritos pela aplicação).
-Caracteres de controle vindos do banco ou do modelo são removidos da saída do terminal. Cada
-pergunta consome cota do provedor.
+- Sem `--live`, é um **dry-run**: mostra os casos, a configuração e o teto de requisições, e nada é
+  enviado ao provedor. `--check-oracles` calcula os gabaritos no banco, ainda sem provedor.
+- Tiers: `smoke` (4 casos: margem com empate no corte, nota IMDb por ano, top 5 atores de Terror e
+  título ambíguo), `official`, `paraphrase`, `freeform`, `policy` e `full` (26). `--id CASO`
+  (repetível) e `--limit N` escolhem casos; `--model` troca o modelo principal; `--out` escolhe o
+  arquivo.
+- `--primary-only` descarta os fallbacks, para que tentativas extras não multipliquem o gasto.
+- `--live` exige chave, modelo e `CINEDATA_REFERENCE_DATE` fixada (os gabaritos foram conferidos
+  com `2026-10-01`). Não há retentativa automática: a primeira falha de provedor ou de banco, uma
+  requisição recusada ou um defeito do pontuador interrompe a execução, e os casos restantes ficam
+  pendentes.
+- `--resume` continua o mesmo arquivo, com as mesmas opções: pula os casos já avaliados e roda de
+  novo os não avaliados.
+- **Cota:** cada caso usa no máximo `CINEDATA_REQUEST_LIMIT` requisições do agente; com o `.env`
+  padrão, o `smoke` custa até 20 e o `full` até 130. O plano mostra o teto antes de executar.
 
-Se o shell não encontrar o comando `cinedata`, ative o ambiente virtual (veja Instalação) ou use
-`python -m cinedata`.
+### Resultados e reprodutibilidade
 
-O `doctor` é offline: ele mostra a configuração efetiva e confere o arquivo do banco (existência,
-leitura e cabeçalho SQLite), sem acessar a rede e sem imprimir a chave da API. Ele separa
-**pendências** (o que impede de usar o projeto) de **avisos** (o que merece conferência, como uma
-chave sem o prefixo esperado, mas não bloqueia).
+Cada caso é gravado assim que termina, em `evals/results/raw/<tier>-<modelo>-<data>.json` (pergunta,
+resposta, SQL, linhas, gabarito, uso e veredito), com um resumo `.md` ao lado. A pasta `raw/` é
+ignorada pelo Git, e a chave (ou qualquer texto com cara de chave) é removida antes de gravar.
+Cada registro guarda os `models_used` do caso, o que importa com `openrouter/free`, em que o
+roteador escolhe o modelo a cada requisição. Execuções reais revisadas são resumidas em
+[`evals/RESULTS.md`](evals/RESULTS.md), o único registro de resultados versionado.
 
-| Código de saída | Significado |
-|---|---|
-| 0 | Sem pendências (o `doctor` pode listar avisos), `--version`/`--help`, ou o `ask` respondeu (inclusive pedido de esclarecimento ou recusa fora do escopo). |
-| 1 | O `doctor` encontrou pendências, ou o `ask` não conseguiu responder (provedor, banco, limites do agente). |
-| 2 | Uso ou configuração inválidos (inclusive chave ou modelo ausentes no `ask`). |
-| 130 | Interrompido com Ctrl+C. |
+Cada arquivo registra o que precisa ser igual para dois resultados conviverem: modelo, fallbacks,
+data de referência e limites; o SHA-256 do código da avaliação (`evals/cases.py`,
+`evals/scoring.py`, `evals/run.py`, `src/cinedata/reference.py`) e do agente (`agent.py`,
+`prompt.py`, `runtime.py`, `llm.py`, `entities.py`, `db.py`, `config.py`); as versões de Python,
+SQLite, PydanticAI e do cliente OpenAI; e o SHA-256 do conteúdo do banco. O `--resume` recusa
+qualquer diferença em vez de misturar resultados. Documentação não entra nessa impressão digital.
 
-Se os acentos aparecerem corrompidos no terminal, defina `PYTHONUTF8=1` (ou
-`PYTHONIOENCODING=utf-8`) e rode o comando de novo. A saída redirecionada já sai em UTF-8 por
-padrão, e `PYTHONIOENCODING` explícito é respeitado.
+### Estado atual
 
-## Testes e qualidade
+A primeira execução real completa do `smoke` (4 casos, `openrouter/free`, data de referência
+2026-10-01) teve **3 pass e 1 fail**: o caso do título ambíguo falhou por `agent_protocol`. Um
+diagnóstico separado desse caso, com o mesmo código, configuração e pergunta, passou com outros
+modelos escolhidos pelo roteador; ele não altera o resultado do smoke. Os `models_used` diferentes
+mostram a variação esperada de um roteador gratuito: resultados reais variam entre execuções,
+enquanto o gabarito e a pontuação continuam determinísticos e validados offline. Não há taxa de
+acerto sobre os 26 casos. Detalhes em [`evals/RESULTS.md`](evals/RESULTS.md).
+
+## Testes
 
 ```bash
 pytest -q
+pytest -m realdb
+pytest -m "not realdb"
 ruff check .
 ruff format --check .
 ```
 
-Os testes padrão são offline. Chamadas reais a modelos ficam bloqueadas por
-`ALLOW_MODEL_REQUESTS=False`, e a resolução de nomes fora do loopback também (`conftest.py`); testes
-provam os dois bloqueios. O agente é testado com um modelo roteirizado (`FunctionModel`) que segue
-um script: fundamentação, ambiguidade, correção de SQL, SQL inseguro, prazo, zero linhas,
-truncamento, limites, laços, injeção vinda do banco, Ctrl+C real (`_thread.interrupt_main`),
-fallback seletivo e a CLI de ponta a ponta. Arquivos: `tests/test_agent.py`,
-`tests/test_llm.py`, `tests/test_cli_ask.py` e `tests/test_agent_boundaries.py` (fronteiras de
-arquitetura: só `db.py` importa `sqlite3`, o agente nunca usa os overrides de limite, nada do
-M1c no agente).
-
-O `pytest` padrão exclui o marcador `llm`. Os testes com **LLM real consomem cota** e só rodam de
-propósito, com `OPENROUTER_API_KEY` e `CINEDATA_MODEL` no `.env` (são 4 perguntas, cada uma com
-no máximo `CINEDATA_REQUEST_LIMIT` requisições do agente). A suíte usa só o modelo principal: ela
-descarta os fallbacks, para que tentativas extras não multipliquem o gasto. No primeiro gasto
-controlado (inclusive com `cinedata ask`), deixe também `CINEDATA_FALLBACK_MODELS=` vazio **no
-`.env`**: uma variável de ambiente vazia conta como "não definida" e não anula o valor do `.env`.
+- **`pytest` padrão é offline** e não fala com o OpenRouter: o `conftest.py` desliga as
+  requisições a modelos (`ALLOW_MODEL_REQUESTS=False`), bloqueia a resolução de nomes fora do
+  loopback, remove `OPENROUTER_API_KEY` e `CINEDATA_*` do ambiente e roda cada teste numa pasta
+  temporária, sem o `.env`. `tests/test_model_requests_blocked.py` prova os bloqueios. O agente
+  é testado com modelos roteirizados (`FunctionModel`).
+- **`realdb`:** testes contra o banco real, somente leitura. Eles usam sempre `data/cinerocket.db`
+  (não leem `CINEDATA_DB_PATH`) e são pulados, com o motivo indicado, quando o arquivo não existe.
+  Assim, um clone sem o banco passa na suíte padrão.
+- **`llm`:** chamadas reais, **fora** do `pytest` padrão e só de propósito. Elas só rodam quando a
+  expressão `-m` cita `llm`; com qualquer outra (como `-m "not realdb"`), são puladas com o motivo
+  indicado. Consomem cota, usam `OPENROUTER_API_KEY` e `CINEDATA_MODEL` do `.env` e só o modelo
+  principal (4 perguntas, cada uma com no máximo `CINEDATA_REQUEST_LIMIT` requisições):
 
 ```bash
-pytest -m llm tests/test_agent_llm.py -v -s -k top_revenue
 pytest -m llm tests/test_agent_llm.py -v -s
 ```
 
-Os testes marcados `realdb` rodam contra o banco real e são **pulados com o motivo indicado** quando
-`data/cinerocket.db` não existe. Use `pytest -m realdb` para rodar só eles e
-`pytest -m "not realdb"` para excluí-los.
-
-Os casos de referência têm dois arquivos de teste. `tests/test_reference.py` (offline) monta
-cenários sintéticos para cada armadilha e compara os 14 SQLs, em bancos aleatórios, com um oráculo
-independente em Python e aritmética exata (`tests/reference_oracle.py`).
-`tests/test_reference_realdb.py` confere o gabarito no banco real, compara os 14 casos com o
-mesmo oráculo sobre o banco inteiro e mede os tempos:
-
-```bash
-pytest tests/test_reference.py
-pytest -m realdb tests/test_reference_realdb.py
-pytest -m realdb -s tests/test_reference_realdb.py -k report
-```
-
-`tests/test_agent_realdb.py` liga o agente ao banco real com modelo roteirizado (sem rede):
-`EntityIndex` e `run_sql` juntos, SQL analítico fora dos 14 exemplos conferido por um oráculo
-próprio, teto de linhas visto pelo modelo, segurança e nenhum byte escrito no arquivo do banco.
+| Área | Arquivos em `tests/` |
+|---|---|
+| Configuração e CLI | `test_config.py`, `test_cli.py`, `test_cli_ask.py` |
+| Banco seguro | `test_db.py`, `test_db_bulk.py`, `test_db_realdb.py` |
+| Entidades | `test_entities.py`, `test_entities_realdb.py` |
+| Gabarito | `test_reference.py`, `test_reference_realdb.py`, `reference_oracle.py` |
+| Agente e provedor | `test_agent.py`, `test_agent_boundaries.py`, `test_llm.py`, `test_agent_realdb.py`, `test_agent_llm.py` |
+| Avaliação | `test_evals_corpus.py`, `test_evals_scoring.py`, `test_evals_run.py`, `test_evals_realdb.py` |
+| Isolamento | `conftest.py`, `test_model_requests_blocked.py` |
 
 ## Limitações conhecidas
 
-- A fundamentação prova que houve um resultado real antes da resposta, não que o SQL é o certo
-  nem que cada frase do texto confere com as linhas; a correção semântica é medida no M3.
-- Um modelo pode rotular uma resposta com dados como `info` sem consultar; o rodapé mostra
-  "sem dados do banco" e o `--json` mostra zero consultas, mas o texto não é verificado.
-- A política de entidades enxerga a chave `sk_*` no SQL: um modelo que ignore `find_entities` e
-  filtre direto pelo texto do título ou do nome (contra as instruções) não é detectado por ela.
-- O fallback é por requisição: numa mesma pergunta, requisições diferentes podem ser respondidas
-  por modelos diferentes (o rastro registra cada uma).
-- `ask()` usa um laço de eventos próprio; em código já assíncrono, use `ask_async()`.
+- **Provedor externo:** disponibilidade, limites de uso e a oferta de modelos gratuitos do
+  OpenRouter estão fora do controle do projeto, e não há retentativa automática.
+- **A correção depende do modelo:** o código garante que a resposta veio depois de dados reais e
+  que nomes ambíguos não são escolhidos às cegas, não que o SQL é o certo. A correção é medida pela
+  avaliação, só nos casos do corpus; com modelo real, só o `smoke` foi executado.
+- **Uma pergunta por vez:** não há memória de conversa. Depois de um pedido de esclarecimento,
+  faça uma nova pergunta mais específica (por exemplo, com o ano do filme).
+- **Resolução de nomes:** só o nome exato e único resolve; o fuzzy só sugere e tem recall limitado
+  (um token errado na primeira e na última letra ao mesmo tempo não é encontrado). A política de
+  ambiguidade enxerga as chaves `sk_*` usadas no SQL: um modelo que filtre direto pelo texto do
+  título, contra as instruções, não é detectado por ela.
+- **Respostas `info` não são verificadas:** o rodapé mostra "sem dados do banco" e o `--json`
+  mostra zero consultas, mas o texto de uma resposta `info` não é conferido.
+- **Pontuador deliberadamente estreito:** a leitura do texto final é determinística, não um juiz de
+  linguagem. Formas incomuns de uma resposta certa podem falhar e prosa solta não é julgada; a
+  lista está em [`evals/README.md`](evals/README.md#limitações).
+- **Modelo variável por requisição:** com `openrouter/free` ou com fallback, requisições de uma
+  mesma pergunta podem ser respondidas por modelos diferentes, e duas execuções da mesma pergunta
+  podem ter desfechos diferentes (o rastro registra cada modelo). `model_responses` conta respostas
+  recebidas, não chamadas HTTP, e não mede consumo exato de cota.
+- **Uso como biblioteca:** `ask()` cria o próprio laço de eventos; em código assíncrono, use
+  `ask_async()`.
 
 ## Estrutura
 
 ```text
-.env.example          modelo das variáveis de ambiente (sem segredos)
-constraints.txt       versões exatas das dependências (gerado por comando)
-data/                 coloque aqui o cinerocket.db (não versionado)
+.env.example          variáveis de ambiente (sem segredos)
+constraints.txt       versões exatas testadas (gerado por pip freeze)
+pyproject.toml        pacote, comando `cinedata`, pytest e ruff
+data/                 lugar do cinerocket.db (não versionado)
 src/cinedata/
   config.py           configuração, validação e janela móvel de datas
   db.py               SafeDatabase: acesso somente leitura e endurecido ao banco
   entities.py         EntityIndex: resolução de filmes, pessoas, gêneros e produtoras
-  reference.py        casos de referência (gabarito da avaliação) e executor genérico
   prompt.py           instruções do agente: esquema, relações, semântica e regras de SQL
-  runtime.py          resposta tipada do modelo, rastro da execução, falhas e avisos
-  agent.py            o agente: dependências, as duas ferramentas, fundamentação e execução
+  agent.py            o agente: ferramentas, validação da resposta e limites
+  runtime.py          resposta tipada, rastro da execução, falhas e avisos
   llm.py              cliente do OpenRouter, fallback seletivo e falhas do provedor
   cli.py              comandos --version, doctor e ask
-tests/                testes offline e testes `realdb`
+  reference.py        gabarito dos 14 exemplos oficiais (avaliação)
+evals/                avaliação (fora do pacote; o agente nunca a importa)
+  cases.py            corpus, regras de conferência e tiers
+  scoring.py          pontuação determinística (sem LLM-juiz)
+  run.py              executor: dry-run, --live, --resume, JSON e resumo
+  RESULTS.md          execuções reais revisadas
+  results/raw/        resultados brutos (não versionados)
+tests/                testes offline, `realdb` e `llm` (opt-in)
 ```
-
-## Segredos
-
-O `.env` e os arquivos de banco SQLite (`*.db` e similares, em qualquer pasta) **nunca** são
-versionados: estão no `.gitignore`, e qualquer exceção precisa ser explícita. Não coloque chaves
-em código, testes ou no `.env.example`, que traz apenas os nomes das variáveis.

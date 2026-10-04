@@ -47,6 +47,18 @@ def test_defaults_without_any_configuration() -> None:
     assert settings.dotenv_path is None
 
 
+def test_env_example_recommends_the_free_router_without_a_key() -> None:
+    # o código não tem modelo padrão (teste acima); a recomendação vive só no .env.example
+    settings = load(dotenv_path=Path(__file__).resolve().parents[1] / ".env.example")
+    assert settings.api_key is None  # o exemplo nunca traz chave
+    assert settings.model == "openrouter/free"
+    assert settings.fallback_models == ()
+    assert settings.reference_date_from_env is False
+    defaults = load()
+    for name in ("db_path", "max_rows", "sql_timeout_s", "request_limit"):
+        assert getattr(settings, name) == getattr(defaults, name), name
+
+
 def test_default_reference_date_is_today() -> None:
     before = date.today()
     settings = load_settings({})
