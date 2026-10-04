@@ -1,0 +1,83 @@
+# CI offline: instala como na Instalação do README e roda o smoke da CLI, o Ruff e o pytest padrão
+# em Ubuntu e Windows. Não usa segredos, não tem .env nem o banco real (os testes realdb são
+# pulados) e nunca seleciona os testes llm: o pytest roda sem -m, então vale o -m 'not llm' do
+# pyproject.toml. Nada aqui fala com o OpenRouter. tests/test_ci_workflow.py confere essas regras.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+    defaults:
+      run:
+        shell: bash  # no Windows, é o Git Bash
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # Executáveis e scripts de ativação da .venv: Scripts no Windows, bin no Linux.
+      VENV_BIN: ${{ matrix.os == 'windows-latest' && '.venv/Scripts' || '.venv/bin' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Os comandos da Instalação, com o Python do setup-python no lugar de py/python3 para que a
+      # .venv use exatamente a versão da matriz. Ativar com source é o caminho do Git Bash e do
+      # Linux; os dois passos seguintes conferem o PowerShell e o CMD.
+      - name: Instalar (ambiente virtual + constraints.txt)
+        run: |
+          python -m venv .venv
+          source "$VENV_BIN/activate"
+          python -m pip install -e ".[dev]" -c constraints.txt
+
+      - name: Ativar no Windows PowerShell
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          .\.venv\Scripts\Activate.ps1
+          cinedata --version
+
+      - name: Ativar no CMD
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call .venv\Scripts\activate.bat
+          cinedata --version
+
+      - name: Smoke da CLI e dry-run da avaliação
+        run: |
+          source "$VENV_BIN/activate"
+          cinedata --version
+          python -m cinedata --help
+          # sem .env, chave e banco, o doctor lista pendências e sai com 1 (2 seria erro de uso)
+          cinedata doctor || test $? -eq 1
+          python -m evals.run --tier smoke
+
+      - name: Ruff
+        run: |
+          source "$VENV_BIN/activate"
+          ruff check .
+          ruff format --check .
+
+      - name: Testes offline
+        run: |
+          source "$VENV_BIN/activate"
+          pytest -q
