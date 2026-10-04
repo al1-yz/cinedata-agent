@@ -209,13 +209,20 @@ veredito de texto diferente de `ok` é `fail` (`answer_text`).
 ## Como executar
 
 Na raiz do repositório (o pacote `evals` não é instalado; ele roda a partir dela), com o
-ambiente ativado e o `.env` configurado. Uma execução real exige `CINEDATA_REFERENCE_DATE`
-fixada; use `2026-10-01`, a data com que os gabaritos foram conferidos no banco real.
+ambiente ativado e o `.env` configurado. Os comandos são os mesmos em PowerShell, CMD, Git Bash,
+Linux e macOS. Estes são offline e não falam com o provedor (o `--check-oracles` precisa do
+banco):
 
 ```bash
 python -m evals.run --help
 python -m evals.run --tier smoke
 python -m evals.run --tier full --check-oracles
+```
+
+Estes executam de verdade e consomem cota. Uma execução real exige `CINEDATA_REFERENCE_DATE`
+fixada; use `2026-10-01`, a data com que os gabaritos foram conferidos no banco real.
+
+```bash
 python -m evals.run --tier smoke --primary-only --live
 python -m evals.run --tier smoke --primary-only --live --resume
 ```

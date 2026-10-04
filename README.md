@@ -5,16 +5,62 @@ CineData Analytics. Ele gera SQL livre (Text-to-SQL) sobre a camada Gold, um ban
 a consulta **somente em modo leitura** e responde em português. É uma ferramenta de linha de
 comando, sem frontend. Projeto da atividade GenAI do Rocket Lab 2026.2.
 
-- **Text-to-SQL livre:** o modelo recebe o esquema da Gold e escreve o SQL de cada pergunta. Não há
-  lista de perguntas aceitas, roteamento por intenção nem SQL pronto.
-- **Somente leitura por construção:** todo acesso ao banco passa pelo `SafeDatabase`, que abre o
-  arquivo em modo leitura e nega por padrão tudo que não seja ler as tabelas da Gold.
-- **Respostas fundamentadas:** uma resposta com dados só é aceita depois de o modelo ter lido o
-  resultado de uma consulta real; um nome ambíguo vira pedido de esclarecimento.
-- **Rastreável:** `--show-sql` e `--json` mostram o SQL executado, as linhas, os tempos e os
-  modelos que responderam, a partir do rastro da aplicação (nunca do texto do modelo).
-- **Avaliação determinística:** 26 casos pontuados por código, sem LLM-juiz. Só o tier `smoke`
-  (4 casos) foi executado com modelo real; não há taxa sobre o corpus (ver [Avaliação](#avaliação)).
+Para rodar, vá direto à [Instalação](#instalação). Para entender o projeto, leia
+[Como funciona](#como-funciona) e as [Perguntas frequentes](#perguntas-frequentes).
+
+## Diferenciais implementados
+
+O enunciado sugere ideias opcionais de criatividade. Os quatro primeiros itens abaixo são ideias
+dele; o último é próprio do projeto. Todos estão implementados e têm testes.
+
+| Diferencial | Como aparece no projeto |
+|---|---|
+| Guardrails | O banco abre somente para leitura, e um authorizer nega por padrão tudo que não seja ler as tabelas da Gold, com limites de tamanho e de tempo. Uma resposta com dados só é aceita depois de o modelo ler o resultado de uma consulta real, e um nome ambíguo vira pedido de esclarecimento. |
+| Fallback e modelos gratuitos | `openrouter/free`, o roteador gratuito do OpenRouter, é a configuração recomendada (custo zero). Até 2 modelos de fallback entram só em falhas transitórias do provedor. |
+| Avaliação com respostas esperadas | 26 casos (os 14 exemplos oficiais e mais 12), com gabarito recalculado por SQL de referência e pontuação determinística em código, sem LLM-juiz. Só o tier `smoke` (4 casos) foi executado com modelo real; não há taxa de acerto sobre o corpus (ver [Avaliação](#avaliação)). |
+| Conexão com a camada Gold | Text-to-SQL livre direto sobre a Gold: sem lista de perguntas aceitas, sem roteamento por intenção e sem SQL pronto. |
+| Rastreabilidade e reprodutibilidade | `--show-sql` e `--json` mostram SQL, linhas, tempos e modelos a partir do rastro da aplicação (nunca do texto do modelo). A avaliação registra a impressão digital do código, das versões e do banco, e a data de referência pode ser fixada. |
+
+Interface visual, gráficos, memória de conversa, cache de respostas e busca semântica ficaram de
+fora por decisão de escopo: o esforço foi para a correção, a segurança e a medição das respostas.
+
+## Como funciona
+
+Cada pergunta percorre este caminho:
+
+```text
+pergunta em linguagem natural
+  → modelo (LLM, via OpenRouter)
+  → resolução de entidades (opcional: quando a pergunta cita um nome)
+  → SQL gerado pelo modelo
+  → validação no SafeDatabase
+  → banco Gold (SQLite), somente leitura
+  → resultado da consulta
+  → resposta em português, fundamentada no resultado
+```
+
+- **Pergunta:** o usuário escreve como falaria, por exemplo
+  `cinedata ask "Quais são os 5 filmes mais populares?"`.
+- **Modelo:** um LLM recebe a pergunta e as instruções do projeto: as tabelas e colunas da Gold, o
+  significado de cada uma e as regras de trabalho. Ele não acessa o banco diretamente; só pode
+  chamar duas ferramentas de dados, `find_entities` e `run_sql`.
+- **Resolução de entidades:** quando a pergunta cita um filme, uma pessoa, um gênero ou uma
+  produtora, o modelo confere o nome com `find_entities`. Só um nome exato e único é resolvido;
+  homônimos e nomes parecidos voltam como candidatos.
+- **SQL gerado:** o modelo escreve uma consulta `SELECT` para aquela pergunta. Nenhum SQL vem de
+  uma lista pronta.
+- **Validação:** o `SafeDatabase` só deixa passar a leitura das tabelas e colunas permitidas
+  (nada de escrita, mudança de estrutura ou tabelas internas) e aplica prazo e teto de linhas.
+- **Gold somente leitura:** o `cinerocket.db` é aberto em modo leitura; nenhuma consulta consegue
+  alterá-lo.
+- **Resultado:** as linhas voltam ao modelo e ficam no rastro da aplicação, que `--show-sql` e
+  `--json` mostram.
+- **Resposta fundamentada:** o modelo responde a partir das linhas recebidas. O código só aceita
+  uma resposta com dados se o modelo leu antes o resultado de uma consulta real, e não deixa um
+  nome ambíguo ser escolhido às cegas.
+
+Os detalhes de cada etapa estão em [Arquitetura](#arquitetura) e
+[Segurança e limites](#segurança-e-limites).
 
 ## Escopo
 
@@ -132,44 +178,91 @@ brutos da avaliação também são ignorados. O `.env.example` traz só nomes e 
 
 ## Requisitos
 
-- **Python 3.12 ou superior.** Desenvolvido e testado com Python 3.14.3 e SQLite 3.50.4; as
-  versões 3.12 e 3.13 não foram exercitadas. O piso vem de `sqlite3.Connection.setconfig`, e o
+- **Python 3.12 ou superior (CPython),** com os ambientes de
+  [Ambientes validados](#ambientes-validados). O piso vem de `sqlite3.Connection.setconfig`, e o
   SQLite embutido precisa ser 3.31 ou superior (o `SafeDatabase` confere cada proteção ao abrir).
+  No Windows, use o Python oficial do [python.org](https://www.python.org/downloads/), que traz o
+  comando `py`.
 - **O banco da atividade,** `cinerocket.db` (cerca de 581 MB, não versionado).
 - **Uma chave do [OpenRouter](https://openrouter.ai/keys), só para chamadas reais ao modelo:**
   `cinedata ask`, `pytest -m llm` e `python -m evals.run --live`. Instalação, `doctor`, testes
   padrão e o dry-run da avaliação não precisam dela.
 - Acesso ao PyPI durante a instalação.
 
+### Ambientes validados
+
+| Ambiente | Situação |
+|---|---|
+| Windows 11 x64 com o CPython 3.14.3 do python.org (SQLite 3.50.4), em PowerShell 5.1, CMD e Git Bash | Validado localmente: instalação pelos comandos abaixo, `doctor`, Ruff e testes offline e `realdb`. |
+| GitHub Actions: `ubuntu-latest` e `windows-latest` com CPython 3.12, 3.13 e 3.14 (`actions/setup-python`) | Cobertos pelo [CI offline](#ci), que roda a cada push: instalação documentada, ativação da `.venv`, smoke da CLI, Ruff e `pytest`, sem banco e sem chave. O resultado de cada execução fica na aba Actions do GitHub. |
+| Python do MSYS2 ou do Cygwin, Python da Microsoft Store, Conda, WSL, macOS, Windows ARM64, Python 3.15 | Não validados. Podem funcionar, mas ficam fora da matriz. |
+
 ## Instalação
 
-Na raiz do repositório, crie o ambiente virtual:
+Rode os comandos na raiz do repositório, uma linha por vez, no bloco do seu terminal. Os passos
+são os mesmos em todos: criar o ambiente virtual `.venv`, ativá-lo, instalar o projeto com as
+versões testadas, criar o `.env` a partir do exemplo (só quando ele ainda não existe) e conferir
+com o `doctor`.
 
-```bash
-python -m venv .venv
-```
+**Windows, PowerShell**
 
-Ative-o conforme o shell:
-
-| Shell | Comando |
-|---|---|
-| PowerShell (Windows) | `.venv\Scripts\Activate.ps1` |
-| Git Bash (Windows) | `source .venv/Scripts/activate` |
-| bash ou zsh (Linux, macOS) | `source .venv/bin/activate` |
-
-Com o ambiente ativo, instale, crie o `.env` e confira:
-
-```bash
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]" -c constraints.txt
-cp .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 cinedata doctor
 ```
 
-- No Windows, se `python` não for encontrado ou abrir a Microsoft Store, crie o ambiente com
-  `py -m venv .venv`; depois de ativado, `python` já é o do ambiente. No Linux e no macOS, use
-  `python3` se esse for o nome do Python 3. No `cmd.exe`, troque `cp` por `copy`.
-- Se o PowerShell recusar o script de ativação ("execução de scripts foi desabilitada"), libere-o
-  só na sessão atual com `Set-ExecutionPolicy -Scope Process RemoteSigned` e ative de novo.
+**Windows, Prompt de Comando (CMD)**
+
+```bat
+py -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install -e ".[dev]" -c constraints.txt
+if not exist .env copy .env.example .env
+cinedata doctor
+```
+
+**Windows, Git Bash (com o Python oficial do Windows)**
+
+```bash
+py -m venv .venv
+source .venv/Scripts/activate
+python -m pip install -e ".[dev]" -c constraints.txt
+[ -f .env ] || cp .env.example .env
+cinedata doctor
+```
+
+**Linux e macOS (bash ou zsh)**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]" -c constraints.txt
+[ -f .env ] || cp .env.example .env
+cinedata doctor
+```
+
+Depois, abra o `.env` num editor de texto (no Windows, `notepad .env`) e preencha
+`OPENROUTER_API_KEY` quando for fazer chamadas reais. Sem a chave e sem o banco, o `doctor` lista
+essas pendências e sai com código 1; a instalação em si já terminou.
+
+- **No Windows, crie a `.venv` com `py`.** O `py` vem com o Python oficial e, por padrão, escolhe
+  um Python oficial instalado, mesmo quando o `python` do PATH é outro (do MSYS2, por exemplo) ou
+  um atalho para a Microsoft Store. Depois de ativar a `.venv`, `python` já é o dela. Com mais de
+  uma versão instalada, escolha uma: `py -3.14 -m venv .venv`.
+- **Por que `Scripts` ou `bin`:** o `venv` segue a convenção de cada sistema. O Python do Windows
+  põe os executáveis e os scripts de ativação em `.venv\Scripts`; o do Linux e o do macOS, em
+  `.venv/bin`. O Git Bash usa `Scripts` porque o Python é o do Windows; só muda a sintaxe
+  (`source` e barras normais). Uma `.venv` com `bin` no Windows foi criada por outro tipo de
+  Python (MSYS2, Cygwin ou WSL) e não serve para os comandos acima.
+- **MSYS2:** o Python do MSYS2 (por exemplo, em `C:\msys64`) não faz parte da matriz validada. Ele
+  pode funcionar, mas estes comandos só foram validados com o Python oficial do Windows.
+- **PowerShell recusou a ativação** ("a execução de scripts foi desabilitada neste sistema"):
+  libere scripts só nesta janela, sem precisar de administrador, com
+  `Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned`, e ative de novo. Ao fechar a
+  janela, a política volta ao que era. O CMD não depende dessa política.
 - `-c constraints.txt` instala exatamente as versões testadas. O arquivo foi gerado no Windows com
   `pip freeze --exclude-editable`; o pip ignora pacotes que a sua plataforma não usa (como
   `colorama`).
@@ -177,13 +270,17 @@ cinedata doctor
   constraints.txt` basta.
 - Se o shell não encontrar `cinedata`, ative o ambiente ou use `python -m cinedata`.
 
+Algo deu errado? A [solução de problemas](docs/TROUBLESHOOTING.md) cobre `python` que abre a
+Microsoft Store, `py` ausente, `.venv` com `bin`, Python do MSYS2, falha na ativação, banco ou
+chave ausentes, HTTP 401 e 429 e o que o `doctor` confere.
+
 ### Banco de dados
 
 Coloque o banco em `data/cinerocket.db` ou aponte `CINEDATA_DB_PATH` para ele. Se o download vier
 como `cinerocket (1).db`, renomeie o arquivo (o `doctor` aponta isso). Ao abrir o banco, o SQLite
 pode criar `cinerocket.db-wal` e `cinerocket.db-shm` ao lado dele; é normal, e o Git os ignora. O
-arquivo do banco nunca é modificado (um teste `realdb` confere). Mais em
-[`data/README.md`](data/README.md).
+arquivo do banco nunca é modificado (um teste `realdb` confere). Mais detalhes, inclusive o comando
+de renomear em cada terminal, em [`data/README.md`](data/README.md).
 
 ## Configuração
 
@@ -229,20 +326,32 @@ cabeçalho SQLite), sem acessar a rede e sem imprimir a chave. Ele separa **pend
 impedem o uso (código de saída 1), de **avisos**, que pedem conferência mas não bloqueiam (código
 0). Um valor inválido, como `CINEDATA_MAX_ROWS=abc`, é reportado com o nome da variável e código 2.
 
+Por ser offline, ele não sabe se a chave é válida ou tem crédito, se o modelo existe ou está com
+limite de uso, nem se o banco tem o esquema da Gold: isso só aparece no `ask` (HTTP 401, 402, 404
+ou 429) ou nos testes `realdb`. A lista completa está em
+[O que o doctor confere](docs/TROUBLESHOOTING.md#o-que-o-doctor-confere).
+
 ## Uso
+
+Os comandos são os mesmos em PowerShell, CMD, Git Bash, Linux e macOS, com a `.venv` ativa.
+Estes são offline e não consomem cota:
 
 ```bash
 cinedata --help
 cinedata ask --help
 cinedata doctor
+```
+
+Estes fazem perguntas reais ao modelo, e cada `ask` consome cota do provedor:
+
+```bash
 cinedata ask "Quais diretores têm mais filmes de Animação lançados a partir de 2010?"
 cinedata ask --show-sql "Qual é a receita média em reais dos filmes de Terror por década?"
 cinedata ask --json "Qual é a nota IMDb do filme Elemental?"
 ```
 
-Cada `ask` consome cota do provedor. A saída traz a resposta, as premissas, as ressalvas, os
-avisos do sistema e um rodapé com o tipo da resposta, o modelo que respondeu e o número de
-respostas recebidas do modelo.
+A saída traz a resposta, as premissas, as ressalvas, os avisos do sistema e um rodapé com o tipo
+da resposta, o modelo que respondeu e o número de respostas recebidas do modelo.
 
 - `--show-sql` lista o SQL **do rastro da aplicação**, com status, linhas e tempo de cada
   consulta, nunca um SQL escrito no texto do modelo.
@@ -262,7 +371,9 @@ lançados nos últimos 3 anos têm nota IMDb acima de 7?" e "O que você sabe re
 | 130 | Interrompido com Ctrl+C. |
 
 Se os acentos aparecerem corrompidos no terminal, defina `PYTHONUTF8=1` (ou
-`PYTHONIOENCODING=utf-8`) e rode o comando de novo. A saída redirecionada já sai em UTF-8.
+`PYTHONIOENCODING=utf-8`) e rode o comando de novo; a sintaxe de cada terminal está na
+[solução de problemas](docs/TROUBLESHOOTING.md#acentos-corrompidos-no-terminal). A saída
+redirecionada já sai em UTF-8.
 
 ## Avaliação
 
@@ -342,12 +453,19 @@ especificação completa da pontuação está em [`evals/README.md`](evals/READM
 
 ### Como executar
 
-Na raiz do repositório (o pacote `evals` não é instalado; ele roda a partir dela):
+Na raiz do repositório (o pacote `evals` não é instalado; ele roda a partir dela), com a `.venv`
+ativa; os comandos são os mesmos em todos os terminais. Offline, sem provedor (o
+`--check-oracles` precisa do banco):
 
 ```bash
 python -m evals.run --help
 python -m evals.run --tier smoke
 python -m evals.run --tier full --check-oracles
+```
+
+Execução real, que consome cota (exige chave, modelo e `CINEDATA_REFERENCE_DATE` fixada):
+
+```bash
 python -m evals.run --tier smoke --primary-only --live
 python -m evals.run --tier smoke --primary-only --live --resume
 ```
@@ -396,6 +514,8 @@ acerto sobre os 26 casos. Detalhes em [`evals/RESULTS.md`](evals/RESULTS.md).
 
 ## Testes
 
+Com a `.venv` ativa, em qualquer terminal (offline, sem cota):
+
 ```bash
 pytest -q
 pytest -m realdb
@@ -421,6 +541,11 @@ ruff format --check .
 pytest -m llm tests/test_agent_llm.py -v -s
 ```
 
+- **Contrato de seleção:** `tests/test_selection_contract.py` roda sessões internas do pytest com o
+  `conftest.py` e as opções reais do projeto sobre testes falsos (sem rede e sem cota) e prova que
+  `pytest -q` não seleciona `llm`, que `-m "not realdb"` os pula, que sem o banco os `realdb` são
+  pulados (nunca falham) e que só uma expressão `-m` que cite `llm` os libera.
+
 | Área | Arquivos em `tests/` |
 |---|---|
 | Configuração e CLI | `test_config.py`, `test_cli.py`, `test_cli_ask.py` |
@@ -429,7 +554,25 @@ pytest -m llm tests/test_agent_llm.py -v -s
 | Gabarito | `test_reference.py`, `test_reference_realdb.py`, `reference_oracle.py` |
 | Agente e provedor | `test_agent.py`, `test_agent_boundaries.py`, `test_llm.py`, `test_agent_realdb.py`, `test_agent_llm.py` |
 | Avaliação | `test_evals_corpus.py`, `test_evals_scoring.py`, `test_evals_run.py`, `test_evals_realdb.py` |
-| Isolamento | `conftest.py`, `test_model_requests_blocked.py` |
+| Isolamento | `conftest.py`, `test_model_requests_blocked.py`, `test_selection_contract.py` |
+| Documentação e CI | `test_docs.py`, `test_ci_workflow.py` |
+
+### CI
+
+O workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) roda a cada push na `main`, em
+pull requests e sob demanda, em `ubuntu-latest` e `windows-latest` com Python 3.12, 3.13 e 3.14:
+
+- instala pelo método documentado (ambiente virtual e
+  `python -m pip install -e ".[dev]" -c constraints.txt`) e ativa a `.venv` como na
+  [Instalação](#instalação): `source .venv/bin/activate` no Linux e, no Windows, `Activate.ps1` no
+  PowerShell, `activate.bat` no CMD e `source .venv/Scripts/activate` no Git Bash. A `.venv` é
+  criada com o Python do `actions/setup-python`, para que a versão seja exatamente a da matriz (na
+  Instalação, `py` e `python3` escolhem o Python instalado na máquina);
+- roda o smoke da CLI (`--version`, `--help`, `doctor` e o dry-run da avaliação), `ruff check`,
+  `ruff format --check` e `pytest -q`;
+- não tem `.env`, chave nem o banco real e não usa segredos do repositório: os testes `realdb` são
+  pulados, os `llm` nem são selecionados (o `pytest` roda sem `-m`, então vale o `-m 'not llm'`
+  do `pyproject.toml`) e nada fala com o OpenRouter. `tests/test_ci_workflow.py` confere isso.
 
 ## Limitações conhecidas
 
@@ -438,8 +581,9 @@ pytest -m llm tests/test_agent_llm.py -v -s
 - **A correção depende do modelo:** o código garante que a resposta veio depois de dados reais e
   que nomes ambíguos não são escolhidos às cegas, não que o SQL é o certo. A correção é medida pela
   avaliação, só nos casos do corpus; com modelo real, só o `smoke` foi executado.
-- **Uma pergunta por vez:** não há memória de conversa. Depois de um pedido de esclarecimento,
-  faça uma nova pergunta mais específica (por exemplo, com o ano do filme).
+- **Uma pergunta por vez:** cada `ask` é independente (memória de conversa ficou fora do escopo).
+  Depois de um pedido de esclarecimento, faça uma nova pergunta mais específica (por exemplo, com
+  o ano do filme).
 - **Resolução de nomes:** só o nome exato e único resolve; o fuzzy só sugere e tem recall limitado
   (um token errado na primeira e na última letra ao mesmo tempo não é encontrado). A política de
   ambiguidade enxerga as chaves `sk_*` usadas no SQL: um modelo que filtre direto pelo texto do
@@ -456,13 +600,68 @@ pytest -m llm tests/test_agent_llm.py -v -s
 - **Uso como biblioteca:** `ask()` cria o próprio laço de eventos; em código assíncrono, use
   `ask_async()`.
 
+## Perguntas frequentes
+
+Respostas curtas sobre as decisões do projeto.
+
+**Por que Text-to-SQL?** As perguntas são analíticas (rankings, médias, contagens, junções) sobre
+dados tabulares. O banco calcula esses valores com exatidão; o modelo só traduz a pergunta em SQL e
+o resultado em texto. O SQL fica auditável (`--show-sql`), e uma pergunta nova não exige código
+novo.
+
+**Por que somente leitura?** O agente só precisa ler, e um SQL escrito por um modelo não é
+confiável por definição: pode estar errado ou ter sido induzido pelo texto da pergunta. Com o banco
+aberto em modo leitura e um authorizer que nega por padrão, nenhuma consulta altera ou apaga dados,
+seja qual for o SQL.
+
+**O que são guardrails?** Proteções em código que não dependem de o modelo obedecer ao prompt: no
+banco (modo leitura, authorizer, limites de tamanho e de tempo), no agente (orçamento de
+requisições e consultas por pergunta, resposta com dados só depois de um resultado lido, política
+para nomes ambíguos) e na saída (rastro escrito pela aplicação, chave nunca exibida).
+
+**Por que resolução de entidades?** O nome digitado nem sempre é o nome no banco: há acentos,
+maiúsculas, erros de digitação e homônimos. Em vez de o modelo adivinhar um
+`WHERE titulo = '...'`, a ferramenta confere se o nome existe e é único e devolve a chave dele;
+nomes parecidos voltam só como sugestão.
+
+**Por que títulos de filmes podem ser ambíguos?** Títulos se repetem no catálogo: há dois
+"Elemental" (2022 e 2023) e 30 filmes chamados "Die Hart 2: Die Harter". "Qual é a nota do
+Elemental?" tem duas respostas, então o agente pede esclarecimento ou responde para todos, em vez
+de escolher um sozinho. O ano ou o `id_filme` na pergunta resolve.
+
+**O que é uma resposta fundamentada?** Uma resposta com dados só é aceita se o modelo leu, numa
+etapa anterior, o resultado de uma consulta bem-sucedida: os números vêm do banco, não da memória
+do modelo. O código confere isso pelo rastro. Fundamentar não prova que o SQL era o certo; isso é o
+que a avaliação mede.
+
+**Por que a avaliação é determinística, e não um LLM-juiz?** Um LLM-juiz gasta cota, varia entre
+execuções e pode aprovar uma resposta errada bem escrita. Aqui o gabarito é recalculado por SQL de
+referência no mesmo banco, e a pontuação é código: o mesmo rastro sempre recebe o mesmo veredito,
+e o pontuador é testado offline. O que varia entre execuções é só o comportamento do modelo.
+
+**Por que os 14 exemplos oficiais não são todo o domínio?** O enunciado os chama de "não
+exaustivos". O agente escreve SQL para qualquer pergunta analítica sobre a Gold; os 14 são o
+benchmark mínimo, com gabarito, e a avaliação acrescenta paráfrases e perguntas novas para medir a
+generalização. Testes garantem que nenhuma pergunta nem SQL de referência entra nas instruções do
+modelo.
+
+**Por que `openrouter/free` no uso e um modelo fixo para comparar modelos?** `openrouter/free` é um
+roteador: a cada requisição, o OpenRouter escolhe um modelo gratuito disponível. Isso dá custo zero
+e mais disponibilidade, mas a composição de modelos muda entre requisições, então um resultado não
+mede um modelo específico. Para um benchmark reproduzível no nível do modelo, fixe um id em
+`CINEDATA_MODEL` (por exemplo `qwen/qwen3.8-27b:free`); nos dois casos, o rastro registra os
+`models_used`.
+
 ## Estrutura
 
 ```text
 .env.example          variáveis de ambiente (sem segredos)
+.github/workflows/    CI offline (ci.yml): Ubuntu e Windows, Python 3.12 a 3.14
 constraints.txt       versões exatas testadas (gerado por pip freeze)
 pyproject.toml        pacote, comando `cinedata`, pytest e ruff
 data/                 lugar do cinerocket.db (não versionado)
+docs/
+  TROUBLESHOOTING.md  solução de problemas de instalação e configuração
 src/cinedata/
   config.py           configuração, validação e janela móvel de datas
   db.py               SafeDatabase: acesso somente leitura e endurecido ao banco
