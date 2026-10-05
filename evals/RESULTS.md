@@ -4,6 +4,19 @@ Registro revisado das execuções com modelo real. Os arquivos brutos (JSON com 
 veredito de cada caso, e o resumo gerado) ficam em `evals/results/raw/`, fora do Git. Nada aqui é
 uma taxa de acerto do corpus de 26 casos: só o tier `smoke` foi executado.
 
+> **Evidência histórica, não validação da revisão atual.** As execuções abaixo rodaram com o
+> agente de impressão digital `f9dd1e23a1049507`. Depois delas, `src/cinedata/db.py` mudou
+> (carga de extensões do SQLite desligada explicitamente e diagnóstico de aspas duplas decidido
+> pelo SQL, para o Linux) e o agente passou a ter outra impressão digital (`3a7f3b052714eb18`
+> quando esta nota foi escrita). O código da avaliação não mudou. Por isso:
+>
+> - estes resultados mostram o comportamento real do projeto **naquela revisão**; a revisão atual
+>   ainda não foi executada com modelo real;
+> - a revisão atual é coberta só pelos testes determinísticos (offline e `realdb`), que também
+>   rodam no CI;
+> - os arquivos brutos ficam preservados como estão, e um `--resume` deles é recusado de
+>   propósito. Uma nova execução real, se feita, entra aqui como execução separada.
+
 ## Configuração
 
 | Item | Valor |
@@ -13,7 +26,7 @@ uma taxa de acerto do corpus de 26 casos: só o tier `smoke` foi executado.
 | `CINEDATA_MODEL` | `openrouter/free` (roteador gratuito do OpenRouter, não um modelo) |
 | `CINEDATA_FALLBACK_MODELS` | vazio |
 | Limites | `CINEDATA_REQUEST_LIMIT=5`, `CINEDATA_MAX_ROWS=50`, `CINEDATA_SQL_TIMEOUT_S=30` |
-| Impressão digital | avaliação `ae4dfbc84d86a3f2`, agente `f9dd1e23a1049507` (as duas execuções abaixo e o código atual) |
+| Impressão digital destas execuções | avaliação `ae4dfbc84d86a3f2` (igual à do código atual); agente `f9dd1e23a1049507` (diferente da do código atual; veja a nota acima) |
 | Ambiente | Python 3.14.3, SQLite 3.50.4, PydanticAI 2.52.0, cliente OpenAI 3.23.0 |
 | Banco | `cinerocket.db`, SHA-256 `5afada60e383…` |
 
@@ -56,7 +69,10 @@ continua 3 pass e 1 fail.
 
 - **Parte determinística:** o gabarito é recalculado por SQL de referência e a pontuação é código;
   o mesmo rastro sempre recebe o mesmo veredito. Essa parte é validada offline e no banco real
-  pelos testes (`pytest`, `pytest -m realdb`), sem modelo nenhum.
+  pelos testes (`pytest`, `pytest -m realdb`), sem modelo nenhum, e essa validação vale para a
+  revisão atual.
+- **Revisão:** os vereditos acima são de uma revisão anterior do agente (veja a nota no início).
+  Eles não provam que a revisão atual passa no mesmo smoke.
 - **Parte estocástica:** o comportamento do modelo. `openrouter/free` escolhe um modelo gratuito a
   cada requisição: 7 modelos diferentes responderam nos 4 casos do smoke, e a execução que falhou e
   a que passou no título ambíguo não tiveram nenhum modelo em comum. Uma execução real é uma

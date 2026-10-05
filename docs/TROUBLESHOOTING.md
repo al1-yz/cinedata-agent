@@ -15,6 +15,7 @@ Problemas comuns de instalação e configuração. Os comandos de instalação d
 - [Chave da API ausente](#chave-da-api-ausente)
 - [Chave expirada ou inválida (HTTP 401)](#chave-expirada-ou-inválida-http-401)
 - [Limite de uso do provedor gratuito (HTTP 429)](#limite-de-uso-do-provedor-gratuito-http-429)
+- [Por que `openrouter/free` usa modelos diferentes](#por-que-openrouterfree-usa-modelos-diferentes)
 - [O que o doctor confere](#o-que-o-doctor-confere)
 - [Acentos corrompidos no terminal](#acentos-corrompidos-no-terminal)
 - [`cinedata` não é reconhecido](#cinedata-não-é-reconhecido)
@@ -158,24 +159,36 @@ resto da suíte continua valendo.
 
 ## Chave da API ausente
 
-Sintoma: o `doctor` lista `OPENROUTER_API_KEY ausente` como pendência, e o `ask` termina com
-"Erro de configuração: OPENROUTER_API_KEY não configurada" (código 2).
+Sintoma: o `doctor` mostra `OPENROUTER_API_KEY` como `AUSENTE` e lista a pendência, e o `ask`
+termina com "Erro de configuração: OPENROUTER_API_KEY não configurada" (código 2).
 
-Solução: crie uma chave em [openrouter.ai/keys](https://openrouter.ai/keys) e cole no `.env`, sem
-aspas e sem espaços, no formato `OPENROUTER_API_KEY=sk-or-v1-...`. A instalação, o `doctor`, os
-testes e o dry-run da avaliação funcionam sem a chave.
+Causa: não há chave no `.env` da pasta atual (o `.env` não existe, foi criado em outra pasta ou a
+linha está vazia). O repositório não traz chave nenhuma: cada pessoa usa a própria conta do
+OpenRouter e a sua própria chave.
+
+Solução:
+
+1. Crie a sua chave em [openrouter.ai/keys](https://openrouter.ai/keys) (conta gratuita; veja o
+   [passo 5 do README](../README.md#5-crie-a-sua-chave-do-openrouter)).
+2. Cole-a no `.env`, logo depois de `OPENROUTER_API_KEY=`, sem aspas e sem espaços. Nunca no
+   `.env.example`: ele é versionado e iria para o Git.
+3. Rode `cinedata doctor` de novo, na raiz do repositório: a linha da chave deve mostrar
+   `presente`.
+
+A instalação, o `doctor`, os testes e o dry-run da avaliação funcionam sem a chave.
 
 ## Chave expirada ou inválida (HTTP 401)
 
-Sintoma: o `doctor` diz que a chave está presente, mas o `ask` termina com "(HTTP 401): o
+Sintoma: o `doctor` mostra a chave como `presente`, mas o `ask` termina com "(HTTP 401): o
 OpenRouter recusou a chave da API" (código 1).
 
-Causa: o `doctor` é offline e só confere se a chave existe e começa com `sk-or-v1-`. Quem valida a
-chave é o OpenRouter, na primeira chamada real.
+Causa: a chave configurada é inválida, expirou, foi revogada ou foi copiada pela metade. O
+`doctor` é offline e só prova que há um valor no `.env` com o prefixo `sk-or-v1-`; quem autentica
+a chave é o OpenRouter, na primeira chamada real.
 
 Solução: gere uma chave nova em [openrouter.ai/keys](https://openrouter.ai/keys) e troque-a no
-`.env`. Uma `OPENROUTER_API_KEY` definida no ambiente do terminal tem prioridade sobre o `.env`;
-se uma chave antiga estiver lá, remova-a da sessão:
+`.env`, inteira. Uma `OPENROUTER_API_KEY` definida no ambiente do terminal tem prioridade sobre o
+`.env`; se uma chave antiga estiver lá, remova-a da sessão:
 
 | Terminal | Comando |
 |---|---|
@@ -191,34 +204,61 @@ shell; remova-a de lá.
 Sintoma: o `ask` termina com "(HTTP 429): limite de uso do provedor atingido" (código 1). Na
 avaliação real, o caso fica "não avaliado", e os seguintes, pendentes.
 
-Causa: modelos gratuitos têm limites de uso (por minuto e por dia), e um endpoint gratuito
-específico pode estar saturado. Não é falha do agente nem da instalação.
+Causa: a chave pode estar perfeitamente válida (um problema de chave seria HTTP 401). O 429 quer
+dizer que o provedor recusou a requisição por limite de uso: os modelos gratuitos têm limites por
+minuto e por dia, e um endpoint gratuito (ou o próprio roteador) pode estar saturado ou fora do ar
+naquele momento. É uma condição do provedor, não uma falha do CineData nem da instalação; na
+avaliação, ela conta como "não avaliado", nunca como resposta errada.
 
 Solução:
 
-- espere alguns minutos e tente de novo;
+- espere e tente de novo mais tarde, sem repetir o comando em sequência: cada tentativa conta nos
+  mesmos limites, e o projeto não sabe quando o provedor vai liberar;
 - prefira `CINEDATA_MODEL=openrouter/free`, que distribui as requisições entre modelos gratuitos;
+  um modelo fixo `:free` costuma esbarrar no limite com mais frequência;
 - ou configure até 2 modelos em `CINEDATA_FALLBACK_MODELS`, que só entram em falhas transitórias
   como esta (cada fallback pode virar mais uma chamada HTTP).
 
 O projeto não repete requisições automaticamente, de propósito, para não gastar cota sem controle.
 Na avaliação, `--resume` roda de novo os casos não avaliados.
 
+## Por que `openrouter/free` usa modelos diferentes
+
+`openrouter/free` não é um modelo: é o roteador gratuito do OpenRouter. A cada requisição, ele
+escolhe um modelo gratuito compatível que esteja disponível, então requisições diferentes (até as
+de uma mesma pergunta) podem ser atendidas por modelos diferentes.
+
+- **Vantagem:** custo zero e mais disponibilidade do que depender de um único endpoint gratuito.
+- **Custo:** menos reprodutibilidade no nível do modelo. A mesma pergunta pode ter respostas
+  diferentes em execuções diferentes; no smoke histórico de
+  [`evals/RESULTS.md`](../evals/RESULTS.md), 7 modelos diferentes responderam nos 4 casos.
+- **Rastro:** o projeto registra os modelos que de fato responderam (`models_used`), no
+  `--json` do `ask` e em cada caso da avaliação.
+- **Modelo fixo:** quando a comparação ou a reprodução no nível do modelo importar, use um id
+  explícito em `CINEDATA_MODEL` (por exemplo `qwen/qwen3.8-27b:free`), sabendo que um endpoint
+  gratuito específico pode estar menos disponível (HTTP 429).
+
 ## O que o doctor confere
 
-`cinedata doctor` é offline: não faz nenhuma chamada de rede e nunca mostra a chave.
+`cinedata doctor` é offline: não faz nenhuma chamada de rede, nunca fala com o OpenRouter e
+nunca mostra a chave.
 
 Ele confere:
 
-- a versão do Python e o sistema operacional;
-- se há um `.env` na pasta atual;
-- se cada variável tem formato e faixa válidos (modelo, fallbacks, limites e data de referência);
-- se a chave existe e começa com `sk-or-v1-`;
-- se o arquivo do banco existe, pode ser lido e tem o cabeçalho de um banco SQLite.
+- a versão do `cinedata`, do Python e o sistema operacional, e a pasta atual;
+- se há um `.env` na pasta atual (e mostra o caminho dele);
+- se a chave está preenchida (mostra só `presente` ou `AUSENTE`) e se começa com `sk-or-v1-`
+  (se não começar, é um aviso);
+- se o modelo está configurado e se cada valor tem formato e faixa válidos (modelo, fallbacks,
+  limites e data de referência), e a janela de datas que resulta deles;
+- se o arquivo do banco existe, é um arquivo, pode ser lido, não está vazio e tem o cabeçalho de
+  um banco SQLite; se houver um `cinerocket (1).db` ao lado, ele sugere renomear.
 
 Ele não confere:
 
-- se a chave é válida, está ativa ou tem crédito (HTTP 401 e 402 aparecem no `ask`);
+- se a chave é válida, se expirou ou foi revogada, nem se tem crédito (HTTP 401 e 402 aparecem no
+  `ask`);
+- se o OpenRouter aceita a chave agora, nem se `openrouter/free` tem um modelo disponível agora;
 - se o modelo existe, suporta tool calling ou está com limite de uso (HTTP 404 e 429 aparecem no
   `ask`);
 - a conexão com a internet e com o OpenRouter;
@@ -226,6 +266,9 @@ Ele não confere:
   abrir o banco, no `ask`, no `python -m evals.run --check-oracles` e nos testes `realdb`;
 - se o Python é o da matriz validada ou se a `.venv` está ativa (use o teste de
   [Qual Python estou usando?](#qual-python-estou-usando)).
+
+Por isso, `OPENROUTER_API_KEY  presente` no `doctor` quer dizer "há uma chave no `.env`", nunca "o
+OpenRouter autenticou esta chave". A primeira confirmação real é o primeiro `cinedata ask`.
 
 Códigos de saída: 0 sem pendências (pode listar avisos), 1 com pendências e 2 com um valor inválido
 na configuração.

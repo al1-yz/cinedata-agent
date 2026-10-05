@@ -5,7 +5,8 @@ CineData Analytics. Ele gera SQL livre (Text-to-SQL) sobre a camada Gold, um ban
 a consulta **somente em modo leitura** e responde em português. É uma ferramenta de linha de
 comando, sem frontend. Projeto da atividade GenAI do Rocket Lab 2026.2.
 
-Para rodar, vá direto à [Instalação](#instalação). Para entender o projeto, leia
+Para rodar do zero (Python, banco, a sua chave do OpenRouter e a primeira pergunta), siga a
+[Instalação](#instalação) passo a passo. Para entender o projeto, leia
 [Como funciona](#como-funciona) e as [Perguntas frequentes](#perguntas-frequentes).
 
 ## Diferenciais implementados
@@ -17,7 +18,7 @@ dele; o último é próprio do projeto. Todos estão implementados e têm testes
 |---|---|
 | Guardrails | O banco abre somente para leitura, e um authorizer nega por padrão tudo que não seja ler as tabelas da Gold, com limites de tamanho e de tempo. Uma resposta com dados só é aceita depois de o modelo ler o resultado de uma consulta real, e um nome ambíguo vira pedido de esclarecimento. |
 | Fallback e modelos gratuitos | `openrouter/free`, o roteador gratuito do OpenRouter, é a configuração recomendada (custo zero). Até 2 modelos de fallback entram só em falhas transitórias do provedor. |
-| Avaliação com respostas esperadas | 26 casos (os 14 exemplos oficiais e mais 12), com gabarito recalculado por SQL de referência e pontuação determinística em código, sem LLM-juiz. Só o tier `smoke` (4 casos) foi executado com modelo real; não há taxa de acerto sobre o corpus (ver [Avaliação](#avaliação)). |
+| Avaliação com respostas esperadas | 26 casos (os 14 exemplos oficiais e mais 12), com gabarito recalculado por SQL de referência e pontuação determinística em código, sem LLM-juiz. Só o tier `smoke` (4 casos) foi executado com modelo real, numa revisão anterior do agente; não há taxa de acerto sobre o corpus (ver [Avaliação](#avaliação)). |
 | Conexão com a camada Gold | Text-to-SQL livre direto sobre a Gold: sem lista de perguntas aceitas, sem roteamento por intenção e sem SQL pronto. |
 | Rastreabilidade e reprodutibilidade | `--show-sql` e `--json` mostram SQL, linhas, tempos e modelos a partir do rastro da aplicação (nunca do texto do modelo). A avaliação registra a impressão digital do código, das versões e do banco, e a data de referência pode ser fixada. |
 
@@ -142,8 +143,10 @@ independentes do `SafeDatabase`, e cada uma tem testes que a exercitam sozinha:
 
 1. **Abertura somente leitura** (`mode=ro`), com `query_only` como reforço.
 2. **Configuração endurecida e conferida por releitura:** `DEFENSIVE` ligado, `TRUSTED_SCHEMA`
-   desligado e aspas duplas que nunca viram texto (DQS desligado). Se a build do SQLite não
-   oferecer alguma dessas proteções, o banco não abre.
+   desligado, aspas duplas que nunca viram texto (DQS desligado) e carga de extensões desligada
+   (pela API C e pela função `load_extension()`). Nada depende do padrão da build, que varia
+   entre sistemas: cada proteção é aplicada e relida, e se a build não a oferecer, o banco não
+   abre.
 3. **Limites do SQLite:** `ATTACH` fechado (`SQLITE_LIMIT_ATTACHED=0`, que também bloqueia
    `VACUUM INTO`), SQL de até 20 KB e tetos de colunas, profundidade de expressão e `UNION`s.
 4. **Authorizer com negação por padrão:** só leitura das 10 tabelas da Gold, das colunas
@@ -183,11 +186,14 @@ brutos da avaliação também são ignorados. O `.env.example` traz só nomes e 
   SQLite embutido precisa ser 3.31 ou superior (o `SafeDatabase` confere cada proteção ao abrir).
   No Windows, use o Python oficial do [python.org](https://www.python.org/downloads/), que traz o
   comando `py`.
-- **O banco da atividade,** `cinerocket.db` (cerca de 581 MB, não versionado).
-- **Uma chave do [OpenRouter](https://openrouter.ai/keys), só para chamadas reais ao modelo:**
-  `cinedata ask`, `pytest -m llm` e `python -m evals.run --live`. Instalação, `doctor`, testes
-  padrão e o dry-run da avaliação não precisam dela.
-- Acesso ao PyPI durante a instalação.
+- **O banco da atividade,** `cinerocket.db` (cerca de 581 MB), fornecido com a atividade. Ele não
+  está no repositório; o [passo 4](#4-coloque-o-banco-de-dados) diz onde colocá-lo.
+- **Uma conta no [OpenRouter](https://openrouter.ai) e uma chave de API sua,** só para as
+  perguntas reais ao modelo: `cinedata ask`, `pytest -m llm` e `python -m evals.run --live`. O
+  repositório não traz chave nenhuma, e a configuração recomendada (`openrouter/free`) não exige
+  comprar créditos ([passo 5](#5-crie-a-sua-chave-do-openrouter)). Instalação, `doctor`, testes
+  padrão e o dry-run da avaliação não precisam de chave nem de rede.
+- Git (ou o ZIP do GitHub) e acesso ao PyPI durante a instalação.
 
 ### Ambientes validados
 
@@ -199,10 +205,37 @@ brutos da avaliação também são ignorados. O `.env.example` traz só nomes e 
 
 ## Instalação
 
-Rode os comandos na raiz do repositório, uma linha por vez, no bloco do seu terminal. Os passos
-são os mesmos em todos: criar o ambiente virtual `.venv`, ativá-lo, instalar o projeto com as
-versões testadas, criar o `.env` a partir do exemplo (só quando ele ainda não existe) e conferir
-com o `doctor`.
+Do zero até a primeira pergunta, em oito passos e nesta ordem. Os comandos rodam na raiz do
+repositório (a pasta `cinedata-agent`), uma linha por vez. Quando a sintaxe muda entre terminais,
+há um bloco ou uma linha para cada um. Se algo falhar, veja a
+[solução de problemas](docs/TROUBLESHOOTING.md).
+
+### 1. Instale o Python
+
+Use Python 3.12 ou superior. No Windows, instale o Python oficial do
+[python.org](https://www.python.org/downloads/), que traz o comando `py` (o passo 3 explica por
+que usá-lo). No Linux e no macOS, use um `python3` 3.12 ou superior. Para conferir a versão:
+
+| Terminal | Comando |
+|---|---|
+| Windows (PowerShell, CMD ou Git Bash) | `py -c "import sys; print(sys.version)"` |
+| Linux, macOS | `python3 --version` |
+
+### 2. Baixe o repositório
+
+Os dois comandos são iguais em todos os terminais. Sem o Git, baixe o ZIP pelo botão **Code** da
+página do repositório no GitHub, extraia e abra o terminal na pasta extraída.
+
+```bash
+git clone https://github.com/al1-yz/cinedata-agent.git
+cd cinedata-agent
+```
+
+### 3. Crie o ambiente virtual e instale as dependências
+
+O ambiente virtual (`.venv`) é uma pasta com um Python só deste projeto, para que as dependências
+não se misturem com as de outros programas. Rode o bloco do seu terminal: ele cria a `.venv`,
+ativa-a e instala o projeto com as versões testadas.
 
 **Windows, PowerShell**
 
@@ -210,8 +243,6 @@ com o `doctor`.
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]" -c constraints.txt
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-cinedata doctor
 ```
 
 **Windows, Prompt de Comando (CMD)**
@@ -220,8 +251,6 @@ cinedata doctor
 py -m venv .venv
 .venv\Scripts\activate.bat
 python -m pip install -e ".[dev]" -c constraints.txt
-if not exist .env copy .env.example .env
-cinedata doctor
 ```
 
 **Windows, Git Bash (com o Python oficial do Windows)**
@@ -230,8 +259,6 @@ cinedata doctor
 py -m venv .venv
 source .venv/Scripts/activate
 python -m pip install -e ".[dev]" -c constraints.txt
-[ -f .env ] || cp .env.example .env
-cinedata doctor
 ```
 
 **Linux e macOS (bash ou zsh)**
@@ -240,13 +267,10 @@ cinedata doctor
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]" -c constraints.txt
-[ -f .env ] || cp .env.example .env
-cinedata doctor
 ```
 
-Depois, abra o `.env` num editor de texto (no Windows, `notepad .env`) e preencha
-`OPENROUTER_API_KEY` quando for fazer chamadas reais. Sem a chave e sem o banco, o `doctor` lista
-essas pendências e sai com código 1; a instalação em si já terminou.
+Com a `.venv` ativa, o prompt mostra `(.venv)`. Num terminal novo, ative de novo (só a segunda
+linha do bloco) antes de usar o projeto.
 
 - **No Windows, crie a `.venv` com `py`.** O `py` vem com o Python oficial e, por padrão, escolhe
   um Python oficial instalado, mesmo quando o `python` do PATH é outro (do MSYS2, por exemplo) ou
@@ -270,17 +294,135 @@ essas pendências e sai com código 1; a instalação em si já terminou.
   constraints.txt` basta.
 - Se o shell não encontrar `cinedata`, ative o ambiente ou use `python -m cinedata`.
 
-Algo deu errado? A [solução de problemas](docs/TROUBLESHOOTING.md) cobre `python` que abre a
-Microsoft Store, `py` ausente, `.venv` com `bin`, Python do MSYS2, falha na ativação, banco ou
-chave ausentes, HTTP 401 e 429 e o que o `doctor` confere.
+### 4. Coloque o banco de dados
 
-### Banco de dados
+O agente responde consultando o **`cinerocket.db`**, o banco SQLite da camada Gold fornecido com a
+atividade (cerca de 581 MB). Esse arquivo **não está no repositório nem no Git** (o `.gitignore`
+ignora `*.db`), então cada pessoa coloca a própria cópia:
 
-Coloque o banco em `data/cinerocket.db` ou aponte `CINEDATA_DB_PATH` para ele. Se o download vier
-como `cinerocket (1).db`, renomeie o arquivo (o `doctor` aponta isso). Ao abrir o banco, o SQLite
-pode criar `cinerocket.db-wal` e `cinerocket.db-shm` ao lado dele; é normal, e o Git os ignora. O
-arquivo do banco nunca é modificado (um teste `realdb` confere). Mais detalhes, inclusive o comando
-de renomear em cada terminal, em [`data/README.md`](data/README.md).
+- copie o arquivo para **`data/cinerocket.db`**, exatamente com esse nome. Se o download veio como
+  `cinerocket (1).db`, renomeie-o; o comando de cada terminal está em
+  [`data/README.md`](data/README.md);
+- ou deixe-o em outra pasta e aponte `CINEDATA_DB_PATH` para ele no `.env` (passo 6).
+
+Sem o banco, o `cinedata ask` não consegue responder e o `doctor` lista o banco como pendência.
+Mesmo assim funcionam a instalação, o `doctor`, o `pytest -q` (os testes `realdb`, que usam o
+banco real, são pulados), o Ruff e o dry-run da avaliação. O banco é aberto só para leitura e nunca
+é modificado; o SQLite pode criar `cinerocket.db-wal` e `cinerocket.db-shm` ao lado dele, o que é
+normal (o Git também os ignora).
+
+### 5. Crie a sua chave do OpenRouter
+
+> **O que é a chave de API.** O CineData acessa os modelos de linguagem pelo
+> [OpenRouter](https://openrouter.ai), um serviço que dá acesso a muitos modelos por uma só API. A
+> chave de API é a senha que identifica **a sua conta** nesse serviço. Cada pessoa que roda o
+> projeto usa a própria conta e a sua própria chave: **o repositório não contém nem fornece a
+> chave do autor**. A chave é exigida mesmo com modelos gratuitos, porque é por ela que o
+> OpenRouter autentica a conta e aplica os limites de uso. Ela fica só no seu `.env` local, que o
+> Git ignora; nunca a coloque no `.env.example`, num commit, num print ou numa mensagem.
+
+1. Crie uma conta gratuita em [openrouter.ai](https://openrouter.ai), se ainda não tiver.
+2. Na página de chaves, [openrouter.ai/keys](https://openrouter.ai/keys), crie uma chave nova.
+3. Copie a chave assim que ela aparecer (ela começa com `sk-or-v1-`) e guarde-a como uma senha: o
+   OpenRouter pode não mostrá-la de novo.
+
+Para a configuração recomendada, `openrouter/free`, não é preciso comprar créditos: esse roteador
+só usa modelos gratuitos. Em troca, valem os limites de uso dos modelos gratuitos, definidos pelo
+OpenRouter (por minuto e por dia) e sujeitos a mudança, e um modelo gratuito pode estar saturado
+ou fora do ar em alguns momentos. Não há garantia de disponibilidade nem uso ilimitado.
+
+### 6. Crie o `.env` e coloque a chave
+
+| Arquivo | Vai para o Git? | O que contém |
+|---|---|---|
+| `.env.example` | sim, é versionado | Um modelo seguro, sem nenhum segredo: os nomes das variáveis e os valores recomendados. |
+| `.env` | não, o `.gitignore` o ignora | A sua configuração local, com a sua chave. Cada pessoa cria o seu. |
+
+Crie o `.env` copiando o modelo. O comando do seu terminal só copia se o `.env` ainda não existir,
+então rodá-lo de novo nunca apaga uma chave já configurada.
+
+**Windows, PowerShell**
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+```
+
+**Windows, Prompt de Comando (CMD)**
+
+```bat
+if not exist .env copy .env.example .env
+```
+
+**Git Bash, Linux e macOS**
+
+```bash
+[ -f .env ] || cp .env.example .env
+```
+
+Abra o `.env` num editor de texto (no Windows, `notepad .env`). As primeiras linhas, iguais às do
+`.env.example`, são estas:
+
+```text
+OPENROUTER_API_KEY=
+CINEDATA_MODEL=openrouter/free
+CINEDATA_FALLBACK_MODELS=
+```
+
+- **`OPENROUTER_API_KEY`:** cole a sua chave real, inteira, logo depois do sinal `=`, sem aspas e
+  sem espaços, e salve o arquivo. A chave real é a que você copiou no passo 5 (as chaves do
+  OpenRouter costumam começar com `sk-or-v1-`). Não escreva nenhum texto de exemplo no lugar dela:
+  o `doctor` não sabe se a chave é real, e um valor inventado só é recusado no primeiro `ask`
+  (HTTP 401).
+- **`CINEDATA_MODEL=openrouter/free`:** deixe como está. É a configuração recomendada, de custo
+  zero: não é um modelo, e sim o roteador gratuito do OpenRouter, que manda cada requisição para
+  um modelo gratuito compatível disponível. Por isso, perguntas diferentes (e até requisições da
+  mesma pergunta) podem ser atendidas por modelos diferentes; o rastro registra quais responderam
+  (`models_used`). Para comparar modelos, fixe um id (veja [Configuração](#configuração)).
+- **`CINEDATA_FALLBACK_MODELS`:** deixe vazio num primeiro uso.
+
+As demais linhas do `.env` têm valores padrão e podem ficar como estão.
+
+### 7. Confira com o `doctor`
+
+```bash
+cinedata doctor
+```
+
+Com tudo no lugar, ele termina com "Nenhuma pendência de configuração." (código de saída 0). Se
+faltar algo, ele lista as pendências (código 1); um valor inválido no `.env` é apontado com o nome
+da variável (código 2).
+
+O `doctor` é **offline**: ele não fala com o OpenRouter nem com a internet e nunca mostra a chave.
+
+| Ele confere (localmente) | Ele não confere |
+|---|---|
+| A versão do Python e o sistema. | Se a chave é válida, se expirou ou foi revogada. |
+| Se há um `.env` na pasta atual. | Se o OpenRouter aceita a chave agora. |
+| Se a chave está preenchida e começa com `sk-or-v1-`. | Se `openrouter/free` tem um modelo disponível agora. |
+| Se cada valor do `.env` tem formato válido. | Se o provedor está com limite de uso (HTTP 429). |
+| Se o arquivo do banco existe, pode ser lido e tem cabeçalho SQLite. | Se o banco tem as tabelas da Gold (isso aparece ao abri-lo). |
+
+Ou seja: `OPENROUTER_API_KEY  presente` no `doctor` só quer dizer que há uma chave no `.env`, não
+que o OpenRouter a autenticou. A primeira confirmação real vem no passo 8. A lista completa está
+em [O que o doctor confere](docs/TROUBLESHOOTING.md#o-que-o-doctor-confere).
+
+### 8. Faça a primeira pergunta
+
+```bash
+cinedata ask "Quais são os 5 filmes de maior bilheteria?"
+```
+
+**Este é o primeiro comando que fala com o OpenRouter.** Ele precisa da sua chave válida e do
+banco, e cada pergunta faz algumas requisições ao modelo (no máximo `CINEDATA_REQUEST_LIMIT`, 5
+por padrão), que contam nos limites de uso da sua conta. A resposta varia com o modelo que o
+roteador escolher. Se aparecer HTTP 401, a chave foi recusada; se aparecer HTTP 429, o provedor
+gratuito está no limite de uso: veja a [solução de problemas](docs/TROUBLESHOOTING.md). A tabela
+[Offline ou online](#offline-ou-online) mostra quais comandos falam com o OpenRouter. Para ver
+também o SQL que o agente executou, acrescente `--show-sql`:
+
+```bash
+cinedata ask --show-sql "Quais são os 5 filmes de maior bilheteria?"
+```
 
 ## Configuração
 
@@ -288,7 +430,7 @@ O `.env` é lido da pasta atual, então execute os comandos na raiz do repositó
 
 | Variável | Necessária para | Padrão | Descrição |
 |---|---|---|---|
-| `OPENROUTER_API_KEY` | chamadas reais ao modelo | (vazio) | Chave do OpenRouter; começa com `sk-or-v1-`. |
+| `OPENROUTER_API_KEY` | chamadas reais ao modelo | (vazio) | A sua chave do OpenRouter ([passo 5](#5-crie-a-sua-chave-do-openrouter)); começa com `sk-or-v1-` e fica só no `.env`. |
 | `CINEDATA_MODEL` | chamadas reais ao modelo | (vazio) | Id no OpenRouter (`provedor/modelo` ou `provedor/modelo:variante`), com suporte a tool calling. O `.env.example` recomenda `openrouter/free`. |
 | `CINEDATA_FALLBACK_MODELS` | opcional | (vazio) | Até 2 modelos, separados por vírgula, usados só em falhas transitórias do provedor. |
 | `CINEDATA_DB_PATH` | opcional | `data/cinerocket.db` | Caminho do banco (relativo à pasta atual ou absoluto). |
@@ -305,7 +447,8 @@ O `.env` é lido da pasta atual, então execute os comandos na raiz do repositó
   - **`openrouter/free` (recomendado, custo zero):** não é um modelo, e sim o roteador gratuito do
     OpenRouter. Cada requisição pode ser atendida por um modelo gratuito compatível diferente, o
     que dá mais disponibilidade do que depender de um endpoint gratuito só; em troca, a
-    composição de modelos varia entre requisições e entre execuções.
+    composição de modelos varia entre requisições e entre execuções. Continua sujeito aos limites
+    de uso e à disponibilidade dos modelos gratuitos.
   - **Um modelo fixo** (por exemplo `qwen/qwen3.8-27b:free`): use quando a reprodutibilidade ou a
     comparação no nível do modelo importar. Um endpoint gratuito específico pode estar com limite
     de uso (HTTP 429) com mais frequência.
@@ -319,30 +462,36 @@ O `.env` é lido da pasta atual, então execute os comandos na raiz do repositó
   `CINEDATA_REFERENCE_DATE`, vale a data de hoje e as respostas mudam com o tempo; fixe uma data
   para resultados reproduzíveis.
 
-### Diagnóstico offline
-
-`cinedata doctor` mostra a configuração efetiva e confere o arquivo do banco (existência, leitura e
-cabeçalho SQLite), sem acessar a rede e sem imprimir a chave. Ele separa **pendências**, que
-impedem o uso (código de saída 1), de **avisos**, que pedem conferência mas não bloqueiam (código
-0). Um valor inválido, como `CINEDATA_MAX_ROWS=abc`, é reportado com o nome da variável e código 2.
-
-Por ser offline, ele não sabe se a chave é válida ou tem crédito, se o modelo existe ou está com
-limite de uso, nem se o banco tem o esquema da Gold: isso só aparece no `ask` (HTTP 401, 402, 404
-ou 429) ou nos testes `realdb`. A lista completa está em
-[O que o doctor confere](docs/TROUBLESHOOTING.md#o-que-o-doctor-confere).
-
 ## Uso
 
-Os comandos são os mesmos em PowerShell, CMD, Git Bash, Linux e macOS, com a `.venv` ativa.
-Estes são offline e não consomem cota:
+### Offline ou online
+
+Só três comandos fazem requisições ao OpenRouter; todo o resto roda offline, sem chave e sem
+rede. Os comandos são os mesmos em PowerShell, CMD, Git Bash, Linux e macOS, com a `.venv` ativa.
+
+| Comando | Fala com o OpenRouter? | Precisa da chave? | Precisa do banco? |
+|---|---|---|---|
+| `cinedata --help`, `cinedata --version` | não (offline) | não | não |
+| `cinedata doctor` | não (offline) | não | não (confere o arquivo, se ele existir) |
+| `pytest -q`, `pytest -m realdb`, `pytest -m "not realdb"` | não (offline: os testes bloqueiam a rede) | não | só nos testes `realdb`, que sem o banco são pulados |
+| `ruff check .`, `ruff format --check .` | não (offline) | não | não |
+| `python -m evals.run --tier smoke` (dry-run da avaliação) | não (offline) | não | não |
+| `python -m evals.run --tier full --check-oracles` | não (offline) | não | sim |
+| `cinedata ask "..."` | **sim (online): consome os limites de uso da sua conta** | sim | sim |
+| `python -m evals.run ... --live` | **sim (online): consome os limites de uso da sua conta** | sim | sim |
+| `pytest -m llm tests/test_agent_llm.py -v -s` (testes `llm`, só de propósito) | **sim (online): consome os limites de uso da sua conta** | sim | sim |
+
+### Perguntas
+
+A ajuda dos comandos é offline:
 
 ```bash
 cinedata --help
 cinedata ask --help
-cinedata doctor
 ```
 
-Estes fazem perguntas reais ao modelo, e cada `ask` consome cota do provedor:
+Estes fazem perguntas reais ao modelo (online), e cada `ask` consome os limites de uso da sua
+conta:
 
 ```bash
 cinedata ask "Quais diretores têm mais filmes de Animação lançados a partir de 2010?"
@@ -511,6 +660,11 @@ modelos escolhidos pelo roteador; ele não altera o resultado do smoke. Os `mode
 mostram a variação esperada de um roteador gratuito: resultados reais variam entre execuções,
 enquanto o gabarito e a pontuação continuam determinísticos e validados offline. Não há taxa de
 acerto sobre os 26 casos. Detalhes em [`evals/RESULTS.md`](evals/RESULTS.md).
+
+Essas execuções reais são evidência histórica de uma revisão anterior do agente: depois delas, o
+`db.py` mudou para o Linux (carga de extensões e diagnóstico de aspas duplas). A revisão atual é
+coberta pelos testes determinísticos, que rodam localmente e no CI; com modelo real, ela ainda não
+foi executada.
 
 ## Testes
 

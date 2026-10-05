@@ -124,12 +124,194 @@ def test_the_four_readme_installations_follow_the_same_steps() -> None:
     installs = [(lang, lines) for lang, lines in blocks(ROOT / "README.md") if INSTALL in lines]
     assert [(lang, lines[0], lines[1]) for lang, lines in installs] == INSTALLATIONS
     for _, lines in installs:
-        # criar e ativar a .venv, instalar, criar o .env (só se faltar) e conferir
-        assert len(lines) == 5 and lines[2] == INSTALL, lines
-        assert ".env.example .env" in lines[3] and lines[4] == "cinedata doctor", lines
+        assert lines[2:] == [INSTALL], lines  # criar a .venv, ativá-la e instalar
     troubleshooting = (ROOT / "docs" / "TROUBLESHOOTING.md").read_text(encoding="utf-8")
     for _, _, activation in INSTALLATIONS:
         assert f"`{activation}`" in troubleshooting, activation
+
+
+# --- primeiro uso: banco, chave do OpenRouter, .env, doctor e primeira pergunta ----------------
+
+
+def section(path: Path, heading: str) -> str:
+    """Texto de um título até o próximo título de nível igual ou maior."""
+    text = path.read_text(encoding="utf-8")
+    level = len(heading) - len(heading.lstrip("#"))
+    start = text.index(heading + "\n")
+    following = re.compile(rf"^#{{1,{level}}} ", re.MULTILINE)
+    found = following.search(text, start + len(heading) + 1)
+    return text[start : found.start() if found else len(text)]
+
+
+def prose(text: str) -> str:
+    """Texto corrido: sem as quebras de linha do Markdown nem o `> ` das citações."""
+    return " ".join(re.sub(r"^> ?", "", line) for line in text.splitlines()).replace("  ", " ")
+
+
+def table_rows(text: str) -> list[list[str]]:
+    return [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in text.splitlines()
+        if line.startswith("| ") and not line.startswith("|---")
+    ]
+
+
+README = ROOT / "README.md"
+TROUBLESHOOTING = ROOT / "docs" / "TROUBLESHOOTING.md"
+
+
+def test_the_first_run_path_covers_every_step_in_order() -> None:
+    install = section(README, "## Instalação")
+    steps = [
+        "python.org",  # 1. Python oficial
+        "git clone https://github.com/",  # 2. repositório
+        "py -m venv .venv",  # 3. ambiente virtual e dependências
+        INSTALL,
+        "`data/cinerocket.db`",  # 4. banco
+        "openrouter.ai/keys",  # 5. a chave do próprio usuário
+        "Copy-Item .env.example .env",  # 6. .env a partir do modelo
+        "OPENROUTER_API_KEY=",
+        "CINEDATA_MODEL=openrouter/free",
+        "cinedata doctor",  # 7. conferência offline
+        'cinedata ask "',  # 8. primeira pergunta real
+    ]
+    positions = [install.index(step) for step in steps]
+    assert positions == sorted(positions), list(zip(steps, positions, strict=True))
+
+
+def test_the_readme_says_the_api_key_is_the_users_own_and_lives_only_in_dotenv() -> None:
+    key = prose(section(README, "### 5. Crie a sua chave do OpenRouter")).lower()
+    for claim in (
+        "sua própria chave",
+        "não contém nem fornece a chave do autor",
+        "mesmo com modelos gratuitos",
+        "nunca a coloque no `.env.example`",
+        "não é preciso comprar créditos",
+        "não há garantia de disponibilidade",
+    ):
+        assert claim in key, claim
+    rows = {
+        row[0]: row for row in table_rows(section(README, "### 6. Crie o `.env` e coloque a chave"))
+    }
+    assert (
+        "versionado" in rows["`.env.example`"][1]
+        and "sem nenhum segredo" in rows["`.env.example`"][2]
+    )
+    assert "ignora" in rows["`.env`"][1] and "sua chave" in rows["`.env`"][2]
+
+
+def test_dotenv_creation_never_overwrites_and_the_readme_excerpt_matches_the_template() -> None:
+    # Um bloco por terminal, só com o comando que copia sem sobrescrever um `.env` existente.
+    copies = {
+        lang: lines
+        for lang, lines in blocks(README)
+        if any(".env.example .env" in line for line in lines)
+    }
+    assert copies == {
+        "powershell": ["if (-not (Test-Path .env)) { Copy-Item .env.example .env }"],
+        "bat": ["if not exist .env copy .env.example .env"],
+        "bash": ["[ -f .env ] || cp .env.example .env"],
+    }
+    template = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    shown = [line for _, lines in blocks(README) for line in lines if re.match(r"[A-Z_]+=", line)]
+    assert shown and set(shown) <= set(template), shown
+    assert "CINEDATA_MODEL=openrouter/free" in shown and "OPENROUTER_API_KEY=" in shown
+
+
+def test_the_readme_separates_offline_from_online_commands() -> None:
+    rows = table_rows(section(README, "### Offline ou online"))[1:]
+    online = [row[0] for row in rows if row[1].startswith("**sim")]
+    offline = [row[0] for row in rows if row[1].startswith("não")]
+    assert len(online) + len(offline) == len(rows)
+    assert len(online) == 3  # só estes falam com o OpenRouter
+    for marker, cell in zip(("cinedata ask", "--live", "-m llm"), online, strict=True):
+        assert marker in cell, (marker, cell)
+    for command in (
+        "cinedata doctor",
+        "pytest -q",
+        "ruff check",
+        "--tier smoke",
+        "cinedata --help",
+    ):
+        assert any(command in cell for cell in offline), command
+
+
+def test_the_readme_says_doctor_is_offline_and_cannot_authenticate_the_key() -> None:
+    doctor = prose(section(README, "### 7. Confira com o `doctor`"))
+    assert "**offline**" in doctor and "não fala com o OpenRouter" in doctor
+    assert "presente" in doctor and "não que o OpenRouter a autenticou" in doctor
+    rows = table_rows(section(README, "### 7. Confira com o `doctor`"))
+    cannot = " ".join(row[1] for row in rows[1:]).lower()
+    for limit in ("válida", "revogada", "aceita", "openrouter/free", "429"):
+        assert limit in cannot, limit
+
+
+def test_the_first_real_question_is_marked_as_online() -> None:
+    first = prose(section(README, "### 8. Faça a primeira pergunta"))
+    commands = [lines[0] for _, lines in blocks(README) if lines and lines[0] in first]
+    assert commands[0].startswith('cinedata ask "'), commands
+    assert "primeiro comando que fala com o OpenRouter" in first
+    assert "401" in first and "429" in first
+
+
+def test_the_readme_database_step_answers_the_first_run_questions() -> None:
+    database = prose(section(README, "### 4. Coloque o banco de dados"))
+    for fact in (
+        "`cinerocket.db`",  # que arquivo
+        "**`data/cinerocket.db`**",  # nome e lugar exatos
+        "não está no repositório nem no git",  # fora do Git
+        "`cinedata_db_path`",  # outro lugar
+        "o `doctor` lista o banco como pendência",  # o que acontece sem ele
+        "são pulados",  # o que ainda dá para testar
+    ):
+        assert fact in database.lower(), fact
+
+
+def test_troubleshooting_covers_the_api_key_and_the_provider() -> None:
+    targets = anchors(TROUBLESHOOTING)
+    for anchor in (
+        "chave-da-api-ausente",
+        "chave-expirada-ou-inválida-http-401",
+        "limite-de-uso-do-provedor-gratuito-http-429",
+        "por-que-openrouterfree-usa-modelos-diferentes",
+        "o-que-o-doctor-confere",
+    ):
+        assert anchor in targets, anchor
+    unauthorized = prose(section(TROUBLESHOOTING, "## Chave expirada ou inválida (HTTP 401)"))
+    assert "revogada" in unauthorized and "`doctor` é offline" in unauthorized
+    limited = prose(section(TROUBLESHOOTING, "## Limite de uso do provedor gratuito (HTTP 429)"))
+    assert "pode estar perfeitamente válida" in limited and "sem repetir" in limited
+    router = prose(section(TROUBLESHOOTING, "## Por que `openrouter/free` usa modelos diferentes"))
+    assert "`models_used`" in router and "modelo fixo" in router.lower()
+
+
+def test_table_cells_never_hide_a_pipe_inside_code() -> None:
+    # No GitHub, um | dentro de uma célula divide a coluna mesmo em `código`: o comando quebra.
+    for path in DOCS:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("|"):
+                spans = re.findall(r"`[^`]*`", line)
+                assert not [span for span in spans if "|" in span.replace("\\|", "")], line
+
+
+@pytest.mark.parametrize("doc", DOCS, ids=lambda path: path.relative_to(ROOT).as_posix())
+def test_no_example_fills_the_key_with_a_value_that_passes_doctor(doc: Path) -> None:
+    # O doctor aceita qualquer valor com o prefixo sk-or-v1-; um exemplo assim, copiado ao pé da
+    # letra, passaria no doctor e só falharia no primeiro ask (HTTP 401).
+    text = doc.read_text(encoding="utf-8")
+    assert not re.findall(r"OPENROUTER_API_KEY=\s*['\"]?sk-or-v1-", text)
+
+
+SECRET = re.compile(r"sk-or-v1-[0-9a-f]{16,}|sk-[A-Za-z0-9]{32,}|ghp_[A-Za-z0-9]{20,}")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [*DOCS, ROOT / ".env.example", ROOT / ".github" / "workflows" / "ci.yml"],
+    ids=lambda path: path.relative_to(ROOT).as_posix(),
+)
+def test_no_real_looking_secret_is_documented(path: Path) -> None:
+    assert not SECRET.findall(path.read_text(encoding="utf-8"))
 
 
 def test_readme_ci_row_matches_the_workflow_matrix() -> None:

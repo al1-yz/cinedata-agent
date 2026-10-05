@@ -7,7 +7,9 @@ são o **benchmark oficial mínimo**; o corpus vai além deles para medir també
 > **Estado:** só o tier `smoke` foi executado com modelo real. A primeira execução completa, com
 > `openrouter/free`, teve 3 pass e 1 fail (`agent_protocol`, no título ambíguo); um diagnóstico
 > separado desse caso passou com outros modelos do roteador, sem alterar o resultado do smoke.
-> Não há taxa de acerto sobre os 26 casos. Detalhes e leitura em [`RESULTS.md`](RESULTS.md).
+> Não há taxa de acerto sobre os 26 casos. Essas execuções são evidência histórica de uma revisão
+> anterior do agente; a revisão atual ainda não foi executada com modelo real. Detalhes e leitura
+> em [`RESULTS.md`](RESULTS.md).
 
 ## O que é medido
 
