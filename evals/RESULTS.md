@@ -4,18 +4,20 @@ Registro revisado das execuções com modelo real. Os arquivos brutos (JSON com 
 veredito de cada caso, e o resumo gerado) ficam em `evals/results/raw/`, fora do Git. Nada aqui é
 uma taxa de acerto do corpus de 26 casos: só o tier `smoke` foi executado.
 
-> **Evidência histórica, não validação da revisão atual.** As execuções abaixo rodaram com o
-> agente de impressão digital `f9dd1e23a1049507`. Depois delas, `src/cinedata/db.py` mudou
+> **Evidência histórica, não validação da revisão atual.** As execuções das seções abaixo, até
+> [Outras execuções](#outras-execuções), rodaram com o agente de impressão digital
+> `f9dd1e23a1049507`. Depois delas, `src/cinedata/db.py` mudou
 > (carga de extensões do SQLite desligada explicitamente e diagnóstico de aspas duplas decidido
 > pelo SQL, para o Linux) e o agente passou a ter outra impressão digital (`3a7f3b052714eb18`
 > quando esta nota foi escrita). O código da avaliação não mudou. Por isso:
 >
 > - estes resultados mostram o comportamento real do projeto **naquela revisão**; a revisão atual
->   ainda não foi executada com modelo real;
-> - a revisão atual é coberta só pelos testes determinísticos (offline e `realdb`), que também
+>   foi executada à parte, em [Revisão atual: smoke controlado](#revisão-atual-smoke-controlado),
+>   no fim deste arquivo;
+> - a revisão atual também é coberta pelos testes determinísticos (offline e `realdb`), que
 >   rodam no CI;
 > - os arquivos brutos ficam preservados como estão, e um `--resume` deles é recusado de
->   propósito. Uma nova execução real, se feita, entra aqui como execução separada.
+>   propósito; a execução da revisão atual tem arquivos brutos próprios.
 
 ## Configuração
 
@@ -87,3 +89,63 @@ continua 3 pass e 1 fail.
 Uma execução do smoke com o modelo fixo `qwen/qwen3.8-27b:free` não avaliou nenhum caso: o
 provedor respondeu HTTP 429 (limite de uso) no primeiro caso, e os outros 3 ficaram pendentes.
 Falha de provedor é "não avaliado" e não conta como falha semântica.
+
+## Revisão atual: smoke controlado
+
+Execução real nova do tier `smoke` com o código atual, depois da mudança do `db.py`. Ela foi
+gravada em arquivos brutos próprios, sem `--resume` e sem reaproveitar nenhum resultado
+histórico.
+
+| Item | Valor |
+|---|---|
+| Commit | `c1ea294` |
+| Impressão digital | agente `3a7f3b052714eb18`; avaliação `ae4dfbc84d86a3f2` |
+| Data da execução | 2026-10-05 (UTC), das 01:20 às 01:22 |
+| `CINEDATA_MODEL` | `openrouter/free` (roteador gratuito do OpenRouter, não um modelo) |
+| `CINEDATA_FALLBACK_MODELS` | vazio (e `--primary-only`) |
+| `CINEDATA_REFERENCE_DATE` | 2026-10-01 |
+| Limites | `CINEDATA_REQUEST_LIMIT=5`, `CINEDATA_MAX_ROWS=50`, `CINEDATA_SQL_TIMEOUT_S=30` |
+| Ambiente | Windows 11, Python 3.14.3, SQLite 3.50.4, PydanticAI 2.52.0, cliente OpenAI 3.23.0 |
+| Banco | `cinerocket.db`, SHA-256 `5afada60e383…` (o mesmo das execuções históricas) |
+| Arquivos brutos | `evals/results/raw/smoke-openrouter-free-agent-3a7f3b05-2026-10-01.json` e o resumo `.md` ao lado |
+| Política | uma execução por caso: sem retentativa manual, sem `--resume`, sem diagnóstico extra |
+
+```bash
+python -m evals.run --tier smoke --primary-only --live --out evals/results/raw/smoke-openrouter-free-agent-3a7f3b05-2026-10-01.json
+```
+
+| Caso | Categoria | Veredito | Respostas do modelo | Chamadas de ferramenta | Tempo (s) | Modelos que responderam (`models_used`) |
+|---|---|---|---|---|---|---|
+| `oficial_03_maior_margem` | official | **fail** (`answer_text`) | 3 | 1 | 17,8 | `inclusionai/ling-3.0-flash-sante:free`, `cohere/north-mini-code:free` |
+| `oficial_06_nota_imdb_por_ano` | official | pass | 3 | 1 | 14,7 | `nvidia/nemotron-3-super-120b-a12b:free`, `liquid/lfm-2.5-2.6b:free` |
+| `livre_01_top5_atores_terror` | freeform | pass | 4 | 2 | 37,2 | `liquid/lfm-2.5-2.6b:free`, `cohere/north-mini-code:free`, `nvidia/nemotron-3-ultra-550b-a55b:free`, `qwen/qwen3.8-27b:free` |
+| `politica_01_titulo_ambiguo` | policy | pass | 4 | 2 | 16,3 | `nvidia/nemotron-3.5-lightning:free`, `inclusionai/ling-3.0-flash-sante:free`, `nvidia/nemotron-3-super-120b-a12b:free`, `qwen/qwen3.8-27b:free` |
+
+Resultado da execução: **3 pass e 1 fail**, com os 4 casos avaliados. Nenhuma falha de provedor
+(nenhum caso não avaliado), nenhum caso pendente e nenhuma falha de protocolo ou de política: a
+única falha é semântica, no texto final. Cada caso executou uma consulta SQL, bem-sucedida e lida
+pelo modelo antes da resposta final.
+
+- `oficial_03_maior_margem`: a consulta reproduziu o gabarito (as 10 linhas), mas o texto final
+  parou na frase de abertura ("Aqui estão os filmes com maior margem de lucro [...] (valores em
+  BRL):") e não trouxe nenhum dos 10 filmes. O pontuador marcou as 10 linhas como ausentes. É
+  falha do conjunto modelo + agente e fica no denominador: o código exige que uma resposta com
+  dados venha depois de um resultado lido, não que o texto o apresente.
+- `oficial_06_nota_imdb_por_ano` e `livre_01_top5_atores_terror`: a consulta reproduziu o gabarito
+  (13 e 5 linhas) e o texto trouxe todas as linhas exigidas. No `livre_01`, `find_entities`
+  resolveu o gênero (`exact_unique`) antes da consulta.
+- `politica_01_titulo_ambiguo`: a busca `find_entities` de filme, na primeira requisição, achou os
+  2 homônimos (`exact_multiple`); a consulta, na segunda, trouxe os dois pelo `id_filme`, com a
+  nota IMDb; a resposta final (`data_answer`) deu a nota de cada um com o ano (Elemental, 2022:
+  6,7; Elemental, 2023: 7,0) e pediu o ano para uma resposta mais específica. É o segundo
+  desfecho que a avaliação aceita, a resposta completa para todos os homônimos, e **não** um
+  pedido de esclarecimento: o agente não escolheu um dos filmes nem afirmou dados sem consulta.
+
+Leitura:
+
+- O placar repete o do smoke original (3 pass e 1 fail), mas o caso que falhou é outro: antes, o
+  título ambíguo (`agent_protocol`); agora, `oficial_03_maior_margem` (`answer_text`).
+  Responderam os mesmos 7 modelos gratuitos do smoke original, em outras combinações por caso.
+  Com `openrouter/free`, cada execução é uma amostra da composição de modelos daquele momento, e
+  repetir pode dar outro desfecho.
+- São 4 dos 26 casos do corpus, executados uma vez: não há taxa de acerto sobre os 26 casos.

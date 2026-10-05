@@ -16,9 +16,9 @@ dele; o último é próprio do projeto. Todos estão implementados e têm testes
 
 | Diferencial | Como aparece no projeto |
 |---|---|
-| Guardrails | O banco abre somente para leitura, e um authorizer nega por padrão tudo que não seja ler as tabelas da Gold, com limites de tamanho e de tempo. Uma resposta com dados só é aceita depois de o modelo ler o resultado de uma consulta real, e um nome ambíguo vira pedido de esclarecimento. |
+| Guardrails | O banco abre somente para leitura, e um authorizer nega por padrão tudo que não seja ler as tabelas da Gold, com limites de tamanho e de tempo. Uma resposta com dados só é aceita depois de o modelo ler o resultado de uma consulta real, e um nome ambíguo nunca é resolvido escolhendo um candidato às escondidas: o agente pede esclarecimento ou, quando consegue uma resposta completa, responde para todos os candidatos encontrados. |
 | Fallback e modelos gratuitos | `openrouter/free`, o roteador gratuito do OpenRouter, é a configuração recomendada (custo zero). Até 2 modelos de fallback entram só em falhas transitórias do provedor. |
-| Avaliação com respostas esperadas | 26 casos (os 14 exemplos oficiais e mais 12), com gabarito recalculado por SQL de referência e pontuação determinística em código, sem LLM-juiz. Só o tier `smoke` (4 casos) foi executado com modelo real, numa revisão anterior do agente; não há taxa de acerto sobre o corpus (ver [Avaliação](#avaliação)). |
+| Avaliação com respostas esperadas | 26 casos (os 14 exemplos oficiais e mais 12), com gabarito recalculado por SQL de referência e pontuação determinística em código, sem LLM-juiz. Só o tier `smoke` (4 casos) foi executado com modelo real, na revisão atual e numa anterior; não há taxa de acerto sobre o corpus (ver [Avaliação](#avaliação)). |
 | Conexão com a camada Gold | Text-to-SQL livre direto sobre a Gold: sem lista de perguntas aceitas, sem roteamento por intenção e sem SQL pronto. |
 | Rastreabilidade e reprodutibilidade | `--show-sql` e `--json` mostram SQL, linhas, tempos e modelos a partir do rastro da aplicação (nunca do texto do modelo). A avaliação registra a impressão digital do código, das versões e do banco, e a data de referência pode ser fixada. |
 
@@ -662,9 +662,13 @@ enquanto o gabarito e a pontuação continuam determinísticos e validados offli
 acerto sobre os 26 casos. Detalhes em [`evals/RESULTS.md`](evals/RESULTS.md).
 
 Essas execuções reais são evidência histórica de uma revisão anterior do agente: depois delas, o
-`db.py` mudou para o Linux (carga de extensões e diagnóstico de aspas duplas). A revisão atual é
-coberta pelos testes determinísticos, que rodam localmente e no CI; com modelo real, ela ainda não
-foi executada.
+`db.py` mudou para o Linux (carga de extensões e diagnóstico de aspas duplas). A revisão atual foi
+executada à parte, uma vez, no mesmo `smoke` com `openrouter/free`
+([detalhes](evals/RESULTS.md#revisão-atual-smoke-controlado)): **3 pass e 1 fail**, sem falha de
+provedor. Desta vez falhou `oficial_03_maior_margem` (o SQL conferiu, mas o texto final não trouxe
+as linhas: `answer_text`), e o título ambíguo passou com a resposta completa para os dois
+homônimos. A revisão atual também é coberta pelos testes determinísticos, que rodam localmente e
+no CI.
 
 ## Testes
 
