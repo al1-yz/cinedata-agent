@@ -39,6 +39,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Registra no log o que muda de uma build para outra: os padrões do SQLite não são iguais
+      # em todos os sistemas (o SafeDatabase aplica e relê cada proteção, sem confiar neles).
+      - name: Diagnóstico do Python e do SQLite
+        env:
+          PYTHONUTF8: "1"  # acentos legíveis no log também no Windows
+        run: |
+          python - <<'EOF'
+          import platform, sqlite3
+          con = sqlite3.connect(":memory:")
+          names = sorted(n for n in dir(sqlite3) if n.startswith("SQLITE_DBCONFIG_") and "RESET" not in n)
+          print("Python", platform.python_version(), "| SQLite", sqlite3.sqlite_version, "|", platform.platform())
+          print("Padrões de uma conexão nova:", {n[16:]: con.getconfig(getattr(sqlite3, n)) for n in names})
+          print("Connection.enable_load_extension:", hasattr(con, "enable_load_extension"))
+          EOF
+
       # Os comandos da Instalação, com o Python do setup-python no lugar de py/python3 para que a
       # .venv use exatamente a versão da matriz. Ativar com source é o caminho do Git Bash e do
       # Linux; os dois passos seguintes conferem o PowerShell e o CMD.

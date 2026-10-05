@@ -1026,6 +1026,31 @@ class LacksSetconfig(sqlite3.Connection):
         raise AttributeError("setconfig")  # como no Python 3.11, que não tem a API
 
 
+class KeepsExtensionsEnabled(sqlite3.Connection):
+    """Build que ignora o pedido de desligar a carga de extensões pela API C."""
+
+    def setconfig(self, op: int, enable: bool = True, /) -> None:
+        if op != sqlite3.SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION:
+            super().setconfig(op, enable)
+
+    def getconfig(self, op: int, /) -> bool:
+        if op == sqlite3.SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION:
+            return True
+        return super().getconfig(op)
+
+
+class RefusesToDisableExtensions(sqlite3.Connection):
+    def enable_load_extension(self, enable: bool, /) -> None:
+        raise sqlite3.OperationalError("not supported")
+
+
+class WithoutLoadableExtensions(sqlite3.Connection):
+    """Python compilado sem extensões carregáveis: a classe não tem os métodos."""
+
+    enable_load_extension = None
+    load_extension = None
+
+
 class IgnoresLimits(sqlite3.Connection):
     def setlimit(self, category: int, limit: int, /) -> int:
         return 0
@@ -1054,6 +1079,8 @@ def test_hardening_passes_on_a_normal_build() -> None:
         (RaisesValueError, "SQLITE_DBCONFIG_TRUSTED_SCHEMA"),
         (RaisesProgrammingError, "SQLITE_DBCONFIG_DQS_DDL"),
         (LacksSetconfig, "SQLITE_DBCONFIG_DQS_DML"),
+        (KeepsExtensionsEnabled, "SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION"),
+        (RefusesToDisableExtensions, "enable_load_extension"),
         (IgnoresLimits, "SQLITE_LIMIT_ATTACHED"),
         (IgnoresQueryOnly, "query_only"),
     ],
@@ -1075,6 +1102,7 @@ def test_hardening_fails_closed_when_a_protection_cannot_be_verified(
         "SQLITE_DBCONFIG_DQS_DDL",
         "SQLITE_DBCONFIG_DEFENSIVE",
         "SQLITE_DBCONFIG_TRUSTED_SCHEMA",
+        "SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION",
         "SQLITE_LIMIT_ATTACHED",
     ],
 )
@@ -1119,6 +1147,94 @@ def test_a_failed_hardening_closes_the_connection_and_never_hands_out_a_database
     assert len(opened) == 1
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         opened[0].execute("SELECT 1")
+
+
+# --- carga de extensões ---------------------------------------------------------------------------
+#
+# Semântica documentada do SQLite: ENABLE_LOAD_EXTENSION=0 desliga a API C e a função SQL
+# load_extension(); =1 liga só a API C; enable_load_extension() liga ou desliga as duas chaves.
+
+MISSING_EXTENSION = "cinedata_extensao_que_nao_existe"  # nunca há um arquivo com esse nome
+ENABLE_LOAD_EXTENSION = sqlite3.SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION
+
+
+def permissive_connection(
+    factory: type[sqlite3.Connection] = sqlite3.Connection,
+) -> sqlite3.Connection:
+    """Conexão com a carga de extensões ligada, como numa build em que esse é o padrão."""
+    con = memory_connection(factory)
+    if hasattr(sqlite3.Connection, "enable_load_extension"):
+        sqlite3.Connection.enable_load_extension(con, True)  # API C e função SQL
+    con.setconfig(ENABLE_LOAD_EXTENSION, True)
+    assert con.getconfig(ENABLE_LOAD_EXTENSION) is True
+    return con
+
+
+def assert_extensions_refused(con: sqlite3.Connection) -> None:
+    """Nem a função SQL nem a API do Python carregam extensões; a recusa vem antes do arquivo."""
+    # "no such function": SQLite compilado sem extensões. Sem authorizer instalado, a recusa vem
+    # do próprio SQLite.
+    with pytest.raises(sqlite3.OperationalError, match="not authorized|no such function"):
+        con.execute(f"SELECT load_extension('{MISSING_EXTENSION}')")
+    load = getattr(con, "load_extension", None)
+    if load is not None:  # a API só existe num Python compilado com extensões carregáveis
+        with pytest.raises(sqlite3.OperationalError, match="not authorized"):
+            load(MISSING_EXTENSION)
+
+
+def test_the_dbconfig_alone_disables_both_the_c_api_and_the_sql_function() -> None:
+    con = permissive_connection()
+    con.setconfig(ENABLE_LOAD_EXTENSION, False)
+    assert con.getconfig(ENABLE_LOAD_EXTENSION) is False
+    assert_extensions_refused(con)
+    con.close()
+
+
+def test_hardening_disables_extension_loading_even_when_the_build_enables_it() -> None:
+    con = permissive_connection()
+    db_module._apply_hardening(con)
+    assert con.getconfig(ENABLE_LOAD_EXTENSION) is False
+    assert_extensions_refused(con)
+    con.close()
+
+
+def test_hardening_also_clears_the_sql_function_switch() -> None:
+    # Defesa em profundidade do enable_load_extension(False): depois do endurecimento, um
+    # DBCONFIG=1 (que liga só a API C) não traz a função SQL de volta.
+    con = permissive_connection()
+    db_module._apply_hardening(con)
+    con.setconfig(ENABLE_LOAD_EXTENSION, True)
+    with pytest.raises(sqlite3.OperationalError, match="not authorized|no such function"):
+        con.execute(f"SELECT load_extension('{MISSING_EXTENSION}')")
+    con.close()
+
+
+def test_a_python_without_loadable_extensions_relies_on_the_dbconfig() -> None:
+    con = permissive_connection(WithoutLoadableExtensions)
+    db_module._apply_hardening(con)  # sem o método não há o que chamar, e isso não é falha
+    assert con.getconfig(ENABLE_LOAD_EXTENSION) is False
+    assert_extensions_refused(con)
+    con.close()
+
+
+def test_the_safe_database_connection_cannot_load_extensions(db: SafeDatabase) -> None:
+    # Camada 1: o authorizer nega a função SQL.
+    with pytest.raises(QueryRejectedError, match="'load_extension' não é permitida"):
+        db.execute(f"SELECT load_extension('{MISSING_EXTENSION}')")
+    # Camada 2: a configuração do SQLite, conferida sem o authorizer na mesma conexão.
+    con = db._con
+    assert con is not None
+    assert con.getconfig(ENABLE_LOAD_EXTENSION) is False
+    con.set_authorizer(None)
+    try:
+        assert_extensions_refused(con)
+    finally:
+        con.set_authorizer(db._authorizer)
+    with pytest.raises(QueryRejectedError):
+        db.execute(f"SELECT load_extension('{MISSING_EXTENSION}')")  # o authorizer voltou
+    # A conexão é privada: nenhum atributo público a entrega, então o contrato é só execute().
+    public = [getattr(db, name) for name in dir(db) if not name.startswith("_")]
+    assert not [value for value in public if isinstance(value, sqlite3.Connection)]
 
 
 class FailsToInstallAuthorizer(sqlite3.Connection):
@@ -1481,14 +1597,107 @@ def test_unknown_column_suggests_the_closest_names_and_shows_the_model(db: SafeD
     assert "dim_movies(" in (error.value.hint or "")
 
 
-def test_double_quoted_text_gets_the_single_quote_hint(db: SafeDatabase) -> None:
-    for sql in (
-        'SELECT count(*) FROM dim_genres WHERE nome_genero = "Drama"',
-        'SELECT "coluna_errada" FROM dim_genres',
-    ):
-        with pytest.raises(QueryFailedError, match="aspas simples"):
-            db.execute(sql)
-    assert db.execute("SELECT count(*) FROM dim_genres WHERE nome_genero = 'Drama'").rows == ((1,),)
+# Com DQS desligado, "Drama" é sempre um nome. Só builds recentes do SQLite sugerem as aspas simples
+# na própria mensagem; o diagnóstico vem do SQL, então é o mesmo em qualquer build.
+DOUBLE_QUOTED_VALUES = [
+    'SELECT count(*) FROM dim_genres WHERE nome_genero = "Drama"',
+    'SELECT count(*) FROM dim_genres WHERE nome_genero="Drama"',
+    'SELECT count(*) FROM dim_genres AS g WHERE g.nome_genero <> "Drama"',
+    'SELECT count(*) FROM dim_genres WHERE nome_genero LIKE "Dra%"',
+    'SELECT count(*) FROM dim_genres WHERE nome_genero IS NOT "Drama"',
+    "SELECT count(*) FROM dim_genres WHERE nome_genero IN ('Ação', \"Drama\")",
+    'SELECT count(*) FROM dim_genres WHERE nome_genero NOT IN ("Drama")',
+    "SELECT titulo FROM dim_movies WHERE data_lancamento BETWEEN \"2001-01-01\" AND '2002-12-31'",
+    'SELECT CASE WHEN nome_genero = "Drama" THEN 1 ELSE 0 END FROM dim_genres',
+]
+# Nomes desconhecidos entre aspas duplas fora de um lugar de valor: coluna inexistente, sem a dica
+# das aspas simples. Os três últimos têm aspas duplas só dentro de um texto ou de um comentário.
+UNKNOWN_DOUBLE_QUOTED_NAMES = [
+    ('SELECT "coluna_errada" FROM dim_genres', "coluna_errada"),
+    ("SELECT count(*) FROM dim_genres WHERE \"nome_generoo\" = 'Drama'", "nome_generoo"),
+    ('SELECT lower("coluna_errada") FROM dim_genres', "coluna_errada"),
+    (
+        'SELECT 1 FROM dim_genres WHERE nome_genero IN (SELECT "coluna_errada" FROM dim_genres)',
+        "coluna_errada",
+    ),
+    ("SELECT coluna_x FROM dim_genres WHERE nome_genero = '\"coluna_x\"'", "coluna_x"),
+    ('SELECT coluna_x FROM dim_genres /* WHERE nome_genero = "coluna_x" */', "coluna_x"),
+    ('SELECT coluna_x FROM dim_genres -- WHERE nome_genero = "coluna_x"', "coluna_x"),
+]
+
+
+@pytest.mark.parametrize("sql", DOUBLE_QUOTED_VALUES)
+def test_double_quoted_text_gets_the_single_quote_hint(db: SafeDatabase, sql: str) -> None:
+    with pytest.raises(QueryFailedError) as error:
+        db.execute(sql)
+    assert "aspas simples" in error.value.message
+    assert "Modelo de dados" in (error.value.hint or "")
+
+
+@pytest.mark.parametrize(("sql", "name"), UNKNOWN_DOUBLE_QUOTED_NAMES)
+def test_an_unknown_double_quoted_identifier_is_an_unknown_column(
+    db: SafeDatabase, sql: str, name: str
+) -> None:
+    with pytest.raises(QueryFailedError) as error:
+        db.execute(sql)
+    assert error.value.message == f"A coluna '{name}' não existe."
+    assert "aspas simples" not in str(error.value)
+
+
+def test_a_misspelled_double_quoted_identifier_still_gets_the_suggestion(db: SafeDatabase) -> None:
+    with pytest.raises(QueryFailedError) as error:
+        db.execute('SELECT "nome_generoo" FROM dim_genres')
+    assert (error.value.hint or "").startswith("Você quis dizer: nome_genero,")
+
+
+def test_known_double_quoted_identifiers_and_single_quoted_text_are_unaffected(
+    db: SafeDatabase,
+) -> None:
+    drama = "SELECT count(*) FROM dim_genres WHERE nome_genero = 'Drama'"
+    assert db.execute(drama).rows == ((1,),)
+    quoted = 'SELECT count(*) FROM "dim_genres" WHERE "nome_genero" = \'Drama\''
+    assert db.execute(quoted).rows == ((1,),)
+    # Um nome conhecido entre aspas duplas vale como coluna até num lugar de valor.
+    every = db.execute("SELECT count(*) FROM dim_genres WHERE nome_genero IS NOT NULL").rows
+    same = 'SELECT count(*) FROM dim_genres WHERE nome_genero = "nome_genero"'
+    assert db.execute(same).rows == every
+    with_quotes = "SELECT count(*) FROM dim_genres WHERE nome_genero = '\"Drama\"'"
+    assert db.execute(with_quotes).rows == ((0,),)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'no such column: "Drama" - should this be a string literal in single-quotes?',
+        "no such column: Drama",
+    ],
+    ids=["sqlite-com-sugestao", "sqlite-sem-sugestao"],
+)
+def test_the_double_quote_diagnosis_does_not_depend_on_the_sqlite_message(
+    db: SafeDatabase, message: str
+) -> None:
+    value = db._query_failed(message, 'SELECT count(*) FROM dim_genres WHERE nome_genero = "Drama"')
+    assert value.message.startswith('A coluna "Drama" não existe. Se "Drama" era um valor')
+    assert "como 'Drama'" in value.message
+    name = db._query_failed(message, 'SELECT "Drama" FROM dim_genres')
+    assert name.message == "A coluna 'Drama' não existe."
+
+
+@pytest.mark.parametrize(
+    ("sql", "values"),
+    [
+        ('SELECT 1 WHERE a = "x"', {"x"}),
+        ('SELECT "x" FROM t', set()),
+        ('SELECT 1 WHERE a IN (\'y\', "x", "Z")', {"x", "z"}),
+        ('SELECT 1 WHERE a IN (SELECT "x" FROM t)', set()),
+        ('SELECT 1 WHERE a IS NOT "x" AND b = "diz ""oi"""', {"x", 'diz "oi"'}),
+        ('SELECT 1 WHERE a = \'"x"\' -- = "y"', set()),
+        ('SELECT 1 WHERE "x" = a', set()),  # lado esquerdo: identificador
+        ('SELECT 1 WHERE lower(a) = lower("x")', set()),  # argumento de função: identificador
+    ],
+)
+def test_double_quoted_values_are_found_only_in_value_positions(sql: str, values: set[str]) -> None:
+    assert db_module._double_quoted_values(sql) == values
 
 
 def test_ambiguous_column_hint(db: SafeDatabase) -> None:

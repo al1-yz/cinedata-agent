@@ -8,8 +8,10 @@ fallback silencioso):
 1. Abertura `mode=ro` (protege só o arquivo principal) por URI montada com `Path.as_uri()`.
 2. Limites do SQLite, com `SQLITE_LIMIT_ATTACHED=0` (fecha ATTACH e VACUUM INTO, que poderiam
    criar arquivos mesmo com `mode=ro`), e configuração: DQS desligado (aspas duplas nunca viram
-   texto em silêncio), DEFENSIVE ligado, TRUSTED_SCHEMA desligado, `query_only` (apenas um
-   extra) e o perfil conservador de cache (64 MB).
+   texto em silêncio), DEFENSIVE ligado, TRUSTED_SCHEMA desligado, carga de extensões desligada
+   (ENABLE_LOAD_EXTENSION=0 desliga a API C e a função SQL; `enable_load_extension(False)`, quando
+   existe, zera também a chave própria da função SQL), `query_only` (apenas um extra) e o perfil
+   conservador de cache (64 MB).
 3. Conferência do esquema esperado da Gold.
 4. Authorizer com negação por padrão: só leitura de tabelas/colunas da allowlist e só funções da
    allowlist. Nunca devolve IGNORE, que viraria NULL silencioso.
@@ -144,12 +146,15 @@ ALLOWED_FUNCTIONS = frozenset(
 )
 # fmt: on
 
-# Proteções obrigatórias. Cada uma é aplicada e RELIDA; qualquer falha impede a conexão.
+# Proteções obrigatórias. Cada uma é aplicada e RELIDA; qualquer falha impede a conexão. O padrão
+# varia com a build (no Ubuntu do CI, a carga de extensões pela API C já vinha ligada), então
+# nenhuma depende do valor de fábrica.
 _REQUIRED_DBCONFIG: tuple[tuple[str, bool], ...] = (
     ("SQLITE_DBCONFIG_DQS_DML", False),
     ("SQLITE_DBCONFIG_DQS_DDL", False),
     ("SQLITE_DBCONFIG_DEFENSIVE", True),
     ("SQLITE_DBCONFIG_TRUSTED_SCHEMA", False),
+    ("SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION", False),
 )
 _LIMITS: tuple[tuple[str, int], ...] = (
     ("SQLITE_LIMIT_ATTACHED", 0),
@@ -442,6 +447,27 @@ def _check_config(con: Any, driver: Any, name: str, wanted: bool) -> str | None:
     return None
 
 
+def _disable_extension_loading(con: Any) -> str | None:
+    """Defesa em profundidade: zera também a chave própria da função SQL `load_extension()`.
+
+    O controle principal é SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION=0 (em `_REQUIRED_DBCONFIG`,
+    aplicado e relido), que já desliga a API C e a função SQL. Mas o SQLite guarda uma chave a
+    mais só para a função SQL, que nenhuma DBCONFIG relê: depois de um DBCONFIG=1, que deveria
+    ligar só a API C, a função SQL volta se essa chave tiver ficado ligada.
+    `enable_load_extension(False)` zera as duas, então nenhuma fica no padrão da build. O método
+    só existe quando o Python foi compilado com extensões carregáveis; se existe e falha, a
+    conexão não é entregue. O authorizer continua negando `load_extension` como camada à parte.
+    """
+    disable = getattr(con, "enable_load_extension", None)
+    if disable is None:
+        return None
+    try:
+        disable(False)
+    except _SETUP_ERRORS as exc:
+        return f"enable_load_extension(False) falhou ({type(exc).__name__})"
+    return None
+
+
 def _check_limit(con: Any, driver: Any, name: str, wanted: int) -> str | None:
     category = getattr(driver, name, None)
     if category is None:
@@ -477,6 +503,7 @@ def _apply_hardening(con: Any, driver: Any = sqlite3) -> None:
     if tuple(driver.sqlite_version_info) < MIN_SQLITE_VERSION:
         floor = _version_text(MIN_SQLITE_VERSION)
         results.append(f"SQLite {driver.sqlite_version} é anterior ao mínimo {floor}")
+    results.append(_disable_extension_loading(con))
     results += [_check_config(con, driver, name, wanted) for name, wanted in _REQUIRED_DBCONFIG]
     results += [_check_limit(con, driver, name, wanted) for name, wanted in _LIMITS]
     results += [_check_pragma(con, *pragma) for pragma in _PRAGMAS]
@@ -602,6 +629,54 @@ def _normalize_cell(value: object, max_chars: int) -> tuple[object, bool]:
 _NO_SUCH_TABLE = re.compile(r"no such table: (?P<name>.+)")
 _NO_SUCH_COLUMN = re.compile(r"no such column: (?P<name>.+?)(?: - should this be.*)?$", re.DOTALL)
 _AMBIGUOUS = re.compile(r"ambiguous column name: (?P<name>.+)")
+
+# Tokens suficientes para achar o contexto de um nome entre aspas duplas (só para mensagens).
+_SQL_TOKEN = re.compile(
+    r"""
+      (?P<skip>\s+|--[^\n]*|/\*.*?(?:\*/|\Z))
+    | (?P<string>'(?:[^']|'')*'?)
+    | (?P<quoted>"(?:[^"]|"")*"?)
+    | (?P<name>`(?:[^`]|``)*`?|\[[^\]]*\]?|[^\W\d]\w*)
+    | (?P<symbol>==|!=|<>|<=|>=|\|\||\S)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+_VALUE_PRECEDERS = frozenset(
+    {"=", "==", "!=", "<>", "<", "<=", ">", ">=", "like", "glob", "is", "between"}
+)
+
+
+def _double_quoted_values(sql: str) -> set[str]:
+    """Nomes entre aspas duplas usados no lugar de um valor de texto (em minúsculas).
+
+    É lugar de valor o lado direito de uma comparação (=, <>, <, LIKE, GLOB, IS [NOT], BETWEEN) e
+    um item de uma lista `IN (...)` de valores. Em qualquer outro lugar (lista do SELECT, FROM,
+    GROUP BY, argumento de função, lado esquerdo de uma comparação), o nome é um identificador.
+    Não depende da mensagem do SQLite, que só em algumas builds sugere as aspas simples.
+    """
+    tokens = [
+        (match.lastgroup, match.group())
+        for match in _SQL_TOKEN.finditer(sql)
+        if match.lastgroup != "skip"
+    ]
+    words = [text.lower() for _, text in tokens]
+    found: set[str] = set()
+    value_lists: list[bool] = []  # por parêntese aberto: True se ele abre uma lista IN de valores
+    for index, (kind, text) in enumerate(tokens):
+        previous = words[index - 1] if index > 0 else ""
+        if text == "(":
+            following = words[index + 1] if index + 1 < len(words) else ""
+            value_lists.append(previous == "in" and following not in ("select", "with", "values"))
+        elif text == ")":
+            if value_lists:
+                value_lists.pop()
+        elif kind == "quoted":
+            is_not = previous == "not" and index > 1 and words[index - 2] == "is"
+            in_list = bool(value_lists) and value_lists[-1] and previous in ("(", ",")
+            if previous in _VALUE_PRECEDERS or is_not or in_list:
+                inner = text[1:-1] if len(text) > 1 and text.endswith('"') else text[1:]
+                found.add(inner.replace('""', '"').lower())
+    return found
 
 
 def _check_max_rows(value: object, *, ceiling: int | None = None) -> int:
@@ -751,7 +826,7 @@ class SafeDatabase:
             columns = tuple(column[0] for column in cursor.description)
             fetched = cursor.fetchmany(max_rows + 1)
         except sqlite3.Error as exc:
-            raise self._translate(exc) from exc
+            raise self._translate(exc, sql) from exc
         finally:
             if cursor is not None:
                 cursor.close()
@@ -778,7 +853,7 @@ class SafeDatabase:
 
     # --- tradução de erros ---
 
-    def _translate(self, exc: sqlite3.Error) -> SafeDatabaseError:
+    def _translate(self, exc: sqlite3.Error, sql: str) -> SafeDatabaseError:
         """Converte um erro do sqlite3 em erro controlado. Pode relançar KeyboardInterrupt."""
         if self._authorizer.denials:  # a lista do authorizer manda; a classe da exceção não
             first = self._authorizer.denials[0]
@@ -797,9 +872,9 @@ class SafeDatabase:
             return QueryRejectedError(
                 "Só uma instrução SQL por vez é aceita.", hint=_READ_ONLY_HINT
             )
-        return self._query_failed(text)
+        return self._query_failed(text, sql)
 
-    def _query_failed(self, text: str) -> QueryFailedError:
+    def _query_failed(self, text: str, sql: str) -> QueryFailedError:
         if match := _NO_SUCH_TABLE.match(text):
             name = match["name"].strip().strip("\"'`[]")
             close = difflib.get_close_matches(name.lower(), list(GOLD_TABLES), n=3, cutoff=0.6)
@@ -808,17 +883,17 @@ class SafeDatabase:
             )
             return QueryFailedError(f"A tabela '{name}' não existe.", hint=hint)
         if match := _NO_SUCH_COLUMN.match(text):
-            name = match["name"].strip()
-            literal = name.startswith('"') and "should this be a string literal" in text
-            bare = name.strip("\"'`[]").rsplit(".", 1)[-1]
+            # Só versões recentes do SQLite põem as aspas e a sugestão na mensagem; a decisão
+            # vem do próprio SQL, para ser a mesma em qualquer build.
+            bare = match["name"].strip().strip("\"'`[]").rsplit(".", 1)[-1]
             close = difflib.get_close_matches(bare.lower(), _ALL_COLUMNS, n=3, cutoff=0.6)
-            if literal:
-                return QueryFailedError(
-                    f'A coluna {name} não existe. Se "{bare}" era um valor de texto, escreva-o '
-                    f"entre aspas simples, como '{bare}': aspas duplas servem só para nomes.",
-                    hint=_SCHEMA_HINT,
-                )
             hint = (f"Você quis dizer: {', '.join(close)}? " if close else "") + _SCHEMA_HINT
+            if bare.lower() in _double_quoted_values(sql):
+                return QueryFailedError(
+                    f'A coluna "{bare}" não existe. Se "{bare}" era um valor de texto, escreva-o '
+                    f"entre aspas simples, como '{bare}': aspas duplas servem só para nomes.",
+                    hint=hint,
+                )
             return QueryFailedError(f"A coluna '{bare}' não existe.", hint=hint)
         if match := _AMBIGUOUS.match(text):
             return QueryFailedError(
